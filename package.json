@@ -1,0 +1,14 @@
+{
+  "name": "roblox-verifier",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "firebase-admin": "^12.1.0",
+    "dotenv": "^16.4.5"
+  }
+}
