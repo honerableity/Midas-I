@@ -58,23 +58,20 @@ module.exports = {
     // after deferReply() on the same interaction, so this branch skips the defer
     // that every other subcommand uses and acks via showModal() instead.
     if (sub === 'unverify') {
-      // Note: unlike other subcommands, this read happens before the ack (showModal
-      // counts as the ack, but must fire on the untouched interaction — can't
-      // deferReply() first the way /verify start does). Same cold-Firestore risk as
-      // the original "Unknown interaction" bug applies here on a cold boot.
-      const record = await getVerifiedUser(interaction.user.id);
-      if (!record) {
-        return interaction.reply({ content: 'You are already not verified!', flags: MessageFlags.Ephemeral });
-      }
-
+      // showModal() must be the very first thing that happens on this interaction —
+      // no Firestore read before it. A cold Firestore connection's first-query
+      // handshake can blow past Discord's 3s ack window, same root cause as the
+      // original "Unknown interaction" bug. So the record lookup (and the "already
+      // not verified" check) moves to *after* showModal(), inside the modal submit
+      // handler, where deferReply() gives a fresh 15-minute window instead.
       const modal = new ModalBuilder()
         .setCustomId('unverify_modal')
         .setTitle('Confirm Unverify');
 
       const usernameInput = new TextInputBuilder()
         .setCustomId('roblox_username')
-        .setLabel(`Type your Roblox username to confirm`)
-        .setPlaceholder(record.robloxUsername)
+        .setLabel('Type your Roblox username to confirm')
+        .setPlaceholder('Your exact Roblox username')
         .setStyle(TextInputStyle.Short)
         .setRequired(true);
 
@@ -88,6 +85,11 @@ module.exports = {
         });
 
         await modalSubmit.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const record = await getVerifiedUser(interaction.user.id);
+        if (!record) {
+          return modalSubmit.editReply('You are already not verified!');
+        }
 
         const typed = modalSubmit.fields.getTextInputValue('roblox_username').trim();
 
