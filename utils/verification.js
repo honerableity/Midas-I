@@ -98,6 +98,37 @@ async function fetchRobloxDescription(username) {
   };
 }
 
+// Full profile pull for /verify profile: account info, badges, groups.
+// robloxId already known (from verifiedUsers record) so this skips the
+// username lookup step that fetchRobloxDescription needs.
+async function fetchRobloxProfileDetails(robloxId) {
+  const userRes = await fetch(`https://users.roblox.com/v1/users/${robloxId}`);
+  if (!userRes.ok) throw new Error(`Roblox user fetch failed: ${userRes.status}`);
+  const user = await userRes.json();
+
+  const badgesRes = await fetch(
+    `https://badges.roblox.com/v1/users/${robloxId}/badges?limit=100&sortOrder=Desc`
+  );
+  if (!badgesRes.ok) throw new Error(`Roblox badges fetch failed: ${badgesRes.status}`);
+  const badgesData = await badgesRes.json();
+
+  const groupsRes = await fetch(`https://groups.roblox.com/v1/users/${robloxId}/groups/roles`);
+  if (!groupsRes.ok) throw new Error(`Roblox groups fetch failed: ${groupsRes.status}`);
+  const groupsData = await groupsRes.json();
+
+  return {
+    username: user.name,
+    displayName: user.displayName,
+    created: user.created, // ISO string
+    hasVerifiedBadge: user.hasVerifiedBadge,
+    badges: badgesData.data ? badgesData.data.map(b => b.name) : [],
+    badgeCountIsCapped: badgesData.data ? badgesData.data.length >= 100 : false, // API caps at 100/page; true count may be higher
+    groups: groupsData.data
+      ? groupsData.data.map(g => ({ name: g.group.name, role: g.role.name }))
+      : [],
+  };
+}
+
 function normalize(str) {
   return str
     .toLowerCase()
@@ -117,6 +148,7 @@ module.exports = {
   getGuildConfig,
   setGuildRole,
   fetchRobloxDescription,
+  fetchRobloxProfileDetails,
   descriptionContainsCode,
   saveVerifiedUser,
   getVerifiedUser,
