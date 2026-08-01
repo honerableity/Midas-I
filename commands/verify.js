@@ -24,6 +24,7 @@ const {
   removeVerifiedUser,
   EXPIRY_MS,
 } = require('../utils/verification.js');
+const { logCommandActivity } = require('../utils/logger.js');
 
 // Builds one page of the Groups list onto the given embed. items is a flat
 // array of pre-formatted "Name — Role" strings. page is 0-indexed.
@@ -73,6 +74,21 @@ module.exports = {
           opt.setName('user').setDescription('Discord user to look up').setRequired(true)
         )
     ),
+
+  // Read by utils/logger.js — describes each subcommand for log-channel embed
+  // labeling. Purely metadata; does not trigger logging by itself. Field keys
+  // here are just documentation for maintainers (logCommandActivity accepts
+  // whatever fields object is passed at the call site), so this stays in sync
+  // manually with the `fields` passed to logCommandActivity() calls below.
+  logSchema: {
+    subcommands: {
+      start: { label: 'Verify — Start', fields: ['discordUser'] },
+      setrole: { label: 'Verify — Set Role', fields: ['discordUser', 'role'] },
+      unverify: { label: 'Verify — Unverify', fields: ['discordUser', 'robloxUsername'] },
+      profile: { label: 'Verify — Profile Lookup', fields: ['discordUser', 'targetUser'] },
+      verifyComplete: { label: 'Verify — Completed', fields: ['discordUser', 'robloxUsername'] },
+    },
+  },
 
   async execute(interaction) {
     if (!interaction.inGuild()) {
@@ -141,6 +157,12 @@ module.exports = {
 
         await removeVerifiedUser(interaction.user.id);
 
+        await logCommandActivity(interaction, {
+          subcommand: 'unverify',
+          success: true,
+          fields: { discordUser: interaction.user, robloxUsername: record.robloxUsername },
+        });
+
         return modalSubmit.editReply('You have been unverified. Your role and verification data have been removed.');
       } catch (err) {
         // awaitModalSubmit timeout throws here; nothing to reply to since no modal was submitted
@@ -160,6 +182,12 @@ module.exports = {
       const record = await getVerifiedUser(target.id);
 
       if (!record) {
+        await logCommandActivity(interaction, {
+          subcommand: 'profile',
+          success: false,
+          fields: { discordUser: interaction.user, targetUser: target },
+          note: 'Target user is not verified.',
+        });
         return interaction.editReply({ content: 'The user is not verified!' });
       }
 
@@ -168,8 +196,20 @@ module.exports = {
         details = await fetchRobloxProfileDetails(record.robloxId);
       } catch (err) {
         console.error('fetchRobloxProfileDetails failed:', err);
+        await logCommandActivity(interaction, {
+          subcommand: 'profile',
+          success: false,
+          fields: { discordUser: interaction.user, targetUser: target },
+          note: 'Roblox API error while fetching profile details.',
+        });
         return interaction.editReply({ content: 'Bot error while contacting Roblox. Try again later.' });
       }
+
+      await logCommandActivity(interaction, {
+        subcommand: 'profile',
+        success: true,
+        fields: { discordUser: interaction.user, targetUser: target },
+      });
 
       // Pagination state lives in this closure per response — one profile card,
       // one collector, reset whenever the tab changes (page always starts at 0
@@ -287,6 +327,11 @@ module.exports = {
       }
       const role = interaction.options.getRole('role');
       await setGuildRole(interaction.guildId, role.id);
+      await logCommandActivity(interaction, {
+        subcommand: 'setrole',
+        success: true,
+        fields: { discordUser: interaction.user, role },
+      });
       return interaction.editReply({ content: `Verified role set to ${role}.` });
     }
 
@@ -325,6 +370,12 @@ module.exports = {
 
     try {
       const dm = await interaction.user.send({ embeds: [embed], components: [row] });
+
+      await logCommandActivity(interaction, {
+        subcommand: 'start',
+        success: true,
+        fields: { discordUser: interaction.user },
+      });
 
       const collector = dm.createMessageComponentCollector({ time: EXPIRY_MS });
 
@@ -408,6 +459,12 @@ module.exports = {
 
           await clearSession(interaction.user.id);
           collector.stop('verified');
+
+          await logCommandActivity(interaction, {
+            subcommand: 'verifyComplete',
+            success: true,
+            fields: { discordUser: interaction.user, robloxUsername: profile.robloxUsername },
+          });
 
           return modalSubmit.editReply(`Verified! You're linked as **${profile.robloxUsername}**. Role assigned.`);
         } catch (err) {
