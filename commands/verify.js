@@ -25,22 +25,18 @@ const {
   EXPIRY_MS,
 } = require('../utils/verification.js');
 
-// Builds one page of a Groups or Badges list onto the given embed. items is a
-// flat array of pre-formatted strings (one per group/badge). page is 0-indexed.
-// isCapped adds a note when the underlying Roblox API only returned the first
-// 100 results (badges.roblox.com hard limit), so the real total may be higher
-// than items.length.
-function paginateListField(embed, label, items, page, pageSize, isCapped = false) {
+// Builds one page of the Groups list onto the given embed. items is a flat
+// array of pre-formatted "Name — Role" strings. page is 0-indexed.
+function paginateListField(embed, label, items, page, pageSize) {
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
   const clampedPage = Math.min(page, totalPages - 1);
   const start = clampedPage * pageSize;
   const slice = items.slice(start, start + pageSize);
 
   const value = slice.length ? slice.join('\n') : 'None';
-  const countLabel = `${items.length}${isCapped ? '+' : ''}`;
 
   embed.addFields({
-    name: `${label} (${countLabel}) — Page ${clampedPage + 1}/${totalPages}`,
+    name: `${label} (${items.length}) — Page ${clampedPage + 1}/${totalPages}`,
     value,
   });
 
@@ -177,7 +173,7 @@ module.exports = {
 
       // Pagination state lives in this closure per response — one profile card,
       // one collector, reset whenever the tab changes (page always starts at 0
-      // on a fresh tab so switching Groups -> Badges doesn't carry over an
+      // on a fresh tab so switching Groups -> Account doesn't carry over an
       // out-of-range page index).
       const state = { tab: 'overview', page: 0 };
 
@@ -205,18 +201,13 @@ module.exports = {
               inline: true,
             },
             { name: 'Verified Badge', value: details.hasVerifiedBadge ? 'Yes' : 'No', inline: true },
-            { name: 'Groups', value: `${details.groups.length}`, inline: true },
-            { name: 'Badges', value: `${details.badges.length}${details.badgeCountIsCapped ? '+' : ''}`, inline: true }
+            { name: 'Groups', value: `${details.groups.length}`, inline: true }
           );
           return embed;
         }
 
         if (state.tab === 'groups') {
           return paginateListField(embed, 'Groups', details.groups.map(g => `${g.name} — ${g.role}`), state.page, PAGE_SIZE);
-        }
-
-        if (state.tab === 'badges') {
-          return paginateListField(embed, 'Badges', details.badges, state.page, PAGE_SIZE, details.badgeCountIsCapped);
         }
 
         // account tab
@@ -232,17 +223,15 @@ module.exports = {
         const tabRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('profile_tab_overview').setLabel('Overview').setStyle(state.tab === 'overview' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
           new ButtonBuilder().setCustomId('profile_tab_groups').setLabel('Groups').setStyle(state.tab === 'groups' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
-          new ButtonBuilder().setCustomId('profile_tab_badges').setLabel('Badges').setStyle(state.tab === 'badges' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
           new ButtonBuilder().setCustomId('profile_tab_account').setLabel('Account').setStyle(state.tab === 'account' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled)
         );
 
         const rows = [tabRow];
 
-        // Prev/Next only make sense on the paginated tabs, and only get added
+        // Prev/Next only make sense on the Groups tab, and only get added
         // when there's more than one page to move between.
-        if (state.tab === 'groups' || state.tab === 'badges') {
-          const list = state.tab === 'groups' ? details.groups : details.badges;
-          const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+        if (state.tab === 'groups') {
+          const totalPages = Math.max(1, Math.ceil(details.groups.length / PAGE_SIZE));
           if (totalPages > 1) {
             rows.push(new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId('profile_page_prev').setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(disabled || state.page === 0),
