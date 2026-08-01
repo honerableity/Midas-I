@@ -18,6 +18,9 @@ const {
   setGuildRole,
   fetchRobloxDescription,
   descriptionContainsCode,
+  saveVerifiedUser,
+  getVerifiedUser,
+  removeVerifiedUser,
   EXPIRY_MS,
 } = require('../utils/verification.js');
 
@@ -37,6 +40,11 @@ module.exports = {
         .addRoleOption(opt =>
           opt.setName('role').setDescription('Role to assign on verify').setRequired(true)
         )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('unverify')
+        .setDescription('Remove your Roblox verification')
     ),
 
   async execute(interaction) {
@@ -45,6 +53,74 @@ module.exports = {
     }
 
     const sub = interaction.options.getSubcommand(true);
+
+    // unverify needs showModal() on the raw interaction — Discord rejects showModal()
+    // after deferReply() on the same interaction, so this branch skips the defer
+    // that every other subcommand uses and acks via showModal() instead.
+    if (sub === 'unverify') {
+      // Note: unlike other subcommands, this read happens before the ack (showModal
+      // counts as the ack, but must fire on the untouched interaction — can't
+      // deferReply() first the way /verify start does). Same cold-Firestore risk as
+      // the original "Unknown interaction" bug applies here on a cold boot.
+      const record = await getVerifiedUser(interaction.user.id);
+      if (!record) {
+        return interaction.reply({ content: 'You are already not verified!', flags: MessageFlags.Ephemeral });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('unverify_modal')
+        .setTitle('Confirm Unverify');
+
+      const usernameInput = new TextInputBuilder()
+        .setCustomId('roblox_username')
+        .setLabel(`Type your Roblox username to confirm`)
+        .setPlaceholder(record.robloxUsername)
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(usernameInput));
+      await interaction.showModal(modal);
+
+      try {
+        const modalSubmit = await interaction.awaitModalSubmit({
+          time: 2 * 60 * 1000,
+          filter: (i) => i.customId === 'unverify_modal' && i.user.id === interaction.user.id,
+        });
+
+        await modalSubmit.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const typed = modalSubmit.fields.getTextInputValue('roblox_username').trim();
+
+        // Exact, case-sensitive match against the stored Roblox username.
+        if (typed !== record.robloxUsername) {
+          return modalSubmit.editReply(`Username didn't match. You typed \`${typed}\`, expected \`${record.robloxUsername}\`. Run \`/verify unverify\` again to retry.`);
+        }
+
+        const config = await getGuildConfig(interaction.guildId);
+
+        if (config?.verifiedRoleId) {
+          try {
+            const guild = await interaction.client.guilds.fetch(interaction.guildId);
+            const member = await guild.members.fetch(interaction.user.id);
+            await member.roles.remove(config.verifiedRoleId);
+          } catch (roleErr) {
+            // Don't block the data deletion over a role-removal hiccup (e.g. member
+            // left the server, or role was already removed manually) — log and continue.
+            console.error('Role removal failed during unverify:', roleErr);
+          }
+        }
+
+        await removeVerifiedUser(interaction.user.id);
+
+        return modalSubmit.editReply('You have been unverified. Your role and verification data have been removed.');
+      } catch (err) {
+        // awaitModalSubmit timeout throws here; nothing to reply to since no modal was submitted
+        if (err?.code !== 'InteractionCollectorError') {
+          console.error('Unverify modal submit error:', err);
+        }
+        return;
+      }
+    }
 
     // Defer immediately, before any Firestore reads. A cold Firestore connection
     // (first query after bot boot) can take long enough to blow past Discord's
@@ -161,6 +237,20 @@ module.exports = {
           } catch (roleErr) {
             console.error('Role assign failed:', roleErr);
             return modalSubmit.editReply('Bot error: could not assign role. Check my role position/permissions.');
+          }
+
+          // Save the Discord <-> Roblox link only after role assign is confirmed
+          // successful, so no orphan record if role-add fails and user has to retry.
+          try {
+            await saveVerifiedUser(interaction.user.id, {
+              robloxId: profile.robloxId,
+              robloxUsername: profile.robloxUsername,
+              guildId: interaction.guildId,
+            });
+          } catch (saveErr) {
+            // Role is already assigned at this point — don't fail the whole flow
+            // over a Firestore write hiccup, just log it for manual backfill.
+            console.error('saveVerifiedUser failed (role already assigned):', saveErr);
           }
 
           await clearSession(interaction.user.id);
