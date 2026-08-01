@@ -17,12 +17,35 @@ const {
   getGuildConfig,
   setGuildRole,
   fetchRobloxDescription,
+  fetchRobloxProfileDetails,
   descriptionContainsCode,
   saveVerifiedUser,
   getVerifiedUser,
   removeVerifiedUser,
   EXPIRY_MS,
 } = require('../utils/verification.js');
+
+// Builds one page of a Groups or Badges list onto the given embed. items is a
+// flat array of pre-formatted strings (one per group/badge). page is 0-indexed.
+// isCapped adds a note when the underlying Roblox API only returned the first
+// 100 results (badges.roblox.com hard limit), so the real total may be higher
+// than items.length.
+function paginateListField(embed, label, items, page, pageSize, isCapped = false) {
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const clampedPage = Math.min(page, totalPages - 1);
+  const start = clampedPage * pageSize;
+  const slice = items.slice(start, start + pageSize);
+
+  const value = slice.length ? slice.join('\n') : 'None';
+  const countLabel = `${items.length}${isCapped ? '+' : ''}`;
+
+  embed.addFields({
+    name: `${label} (${countLabel}) — Page ${clampedPage + 1}/${totalPages}`,
+    value,
+  });
+
+  return embed;
+}
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -45,6 +68,14 @@ module.exports = {
       sub
         .setName('unverify')
         .setDescription('Remove your Roblox verification')
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('profile')
+        .setDescription('Look up a member\'s linked Roblox profile')
+        .addUserOption(opt =>
+          opt.setName('user').setDescription('Discord user to look up').setRequired(true)
+        )
     ),
 
   async execute(interaction) {
@@ -122,6 +153,137 @@ module.exports = {
         }
         return;
       }
+    }
+
+    // profile is public (not ephemeral) on purpose — mods need to see it to catch misuse —
+    // so it gets its own non-ephemeral defer instead of the shared ephemeral one below.
+    if (sub === 'profile') {
+      await interaction.deferReply();
+
+      const target = interaction.options.getUser('user', true);
+      const record = await getVerifiedUser(target.id);
+
+      if (!record) {
+        return interaction.editReply({ content: 'The user is not verified!' });
+      }
+
+      let details;
+      try {
+        details = await fetchRobloxProfileDetails(record.robloxId);
+      } catch (err) {
+        console.error('fetchRobloxProfileDetails failed:', err);
+        return interaction.editReply({ content: 'Bot error while contacting Roblox. Try again later.' });
+      }
+
+      // Pagination state lives in this closure per response — one profile card,
+      // one collector, reset whenever the tab changes (page always starts at 0
+      // on a fresh tab so switching Groups -> Badges doesn't carry over an
+      // out-of-range page index).
+      const state = { tab: 'overview', page: 0 };
+
+      const PAGE_SIZE = 10;
+
+      function buildEmbed() {
+        const embed = new EmbedBuilder()
+          .setTitle(`Roblox Profile — ${details.username}`)
+          .setColor(0x00b0f4)
+          .setFooter({ text: `Discord: ${target.username}` });
+
+        if (state.tab === 'overview') {
+          const createdMs = Date.parse(details.created);
+          const accountAgeDays = Number.isNaN(createdMs)
+            ? null
+            : Math.floor((Date.now() - createdMs) / (1000 * 60 * 60 * 24));
+
+          embed.addFields(
+            { name: 'Discord User', value: `${target}`, inline: true },
+            { name: 'Roblox Username', value: details.username, inline: true },
+            { name: 'Display Name', value: details.displayName || details.username, inline: true },
+            {
+              name: 'Account Age',
+              value: accountAgeDays === null ? 'Unknown' : `${accountAgeDays} days`,
+              inline: true,
+            },
+            { name: 'Verified Badge', value: details.hasVerifiedBadge ? 'Yes' : 'No', inline: true },
+            { name: 'Groups', value: `${details.groups.length}`, inline: true },
+            { name: 'Badges', value: `${details.badges.length}${details.badgeCountIsCapped ? '+' : ''}`, inline: true }
+          );
+          return embed;
+        }
+
+        if (state.tab === 'groups') {
+          return paginateListField(embed, 'Groups', details.groups.map(g => `${g.name} — ${g.role}`), state.page, PAGE_SIZE);
+        }
+
+        if (state.tab === 'badges') {
+          return paginateListField(embed, 'Badges', details.badges, state.page, PAGE_SIZE, details.badgeCountIsCapped);
+        }
+
+        // account tab
+        embed.addFields(
+          { name: 'Roblox ID', value: `${record.robloxId}`, inline: true },
+          { name: 'Verified At', value: `<t:${Math.floor(record.verifiedAt / 1000)}:F>`, inline: true },
+          { name: 'Verified Badge', value: details.hasVerifiedBadge ? 'Yes' : 'No', inline: true }
+        );
+        return embed;
+      }
+
+      function buildComponents(disabled = false) {
+        const tabRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('profile_tab_overview').setLabel('Overview').setStyle(state.tab === 'overview' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
+          new ButtonBuilder().setCustomId('profile_tab_groups').setLabel('Groups').setStyle(state.tab === 'groups' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
+          new ButtonBuilder().setCustomId('profile_tab_badges').setLabel('Badges').setStyle(state.tab === 'badges' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
+          new ButtonBuilder().setCustomId('profile_tab_account').setLabel('Account').setStyle(state.tab === 'account' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled)
+        );
+
+        const rows = [tabRow];
+
+        // Prev/Next only make sense on the paginated tabs, and only get added
+        // when there's more than one page to move between.
+        if (state.tab === 'groups' || state.tab === 'badges') {
+          const list = state.tab === 'groups' ? details.groups : details.badges;
+          const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+          if (totalPages > 1) {
+            rows.push(new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('profile_page_prev').setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(disabled || state.page === 0),
+              new ButtonBuilder().setCustomId('profile_page_next').setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(disabled || state.page >= totalPages - 1)
+            ));
+          }
+        }
+
+        return rows;
+      }
+
+      const message = await interaction.editReply({ embeds: [buildEmbed()], components: buildComponents() });
+
+      const collector = message.createMessageComponentCollector({ time: 5 * 60 * 1000 });
+
+      collector.on('collect', async (btnInteraction) => {
+        if (btnInteraction.user.id !== interaction.user.id) {
+          return btnInteraction.reply({ content: 'Only the person who ran this command can use these buttons.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (btnInteraction.customId.startsWith('profile_tab_')) {
+          state.tab = btnInteraction.customId.replace('profile_tab_', '');
+          state.page = 0; // reset page on tab switch, see note above
+        } else if (btnInteraction.customId === 'profile_page_prev') {
+          state.page = Math.max(0, state.page - 1);
+        } else if (btnInteraction.customId === 'profile_page_next') {
+          state.page += 1;
+        }
+
+        await btnInteraction.update({ embeds: [buildEmbed()], components: buildComponents() });
+      });
+
+      collector.on('end', async () => {
+        try {
+          await interaction.editReply({ components: buildComponents(true) });
+        } catch {
+          // message may have been deleted by then; nothing more to do
+        }
+      });
+
+      return;
     }
 
     // Defer immediately, before any Firestore reads. A cold Firestore connection
