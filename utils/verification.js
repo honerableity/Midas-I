@@ -98,19 +98,17 @@ async function fetchRobloxDescription(username) {
   };
 }
 
-// Full profile pull for /verify profile: account info, badges, groups.
+// Full profile pull for /verify profile: account info + groups.
 // robloxId already known (from verifiedUsers record) so this skips the
 // username lookup step that fetchRobloxDescription needs.
+// Note: badges.roblox.com is intentionally not called here — Roblox removed
+// unauthenticated access to that endpoint (4 May '26 API change), so it 401s
+// for every request without a logged-in .ROBLOSECURITY cookie. Not worth
+// standing up a Roblox account session just for a badge count.
 async function fetchRobloxProfileDetails(robloxId) {
   const userRes = await fetch(`https://users.roblox.com/v1/users/${robloxId}`);
   if (!userRes.ok) throw new Error(`Roblox user fetch failed: ${userRes.status}`);
   const user = await userRes.json();
-
-  const badgesRes = await fetch(
-    `https://badges.roblox.com/v1/users/${robloxId}/badges?limit=100&sortOrder=Desc`
-  );
-  if (!badgesRes.ok) throw new Error(`Roblox badges fetch failed: ${badgesRes.status}`);
-  const badgesData = await badgesRes.json();
 
   const groupsRes = await fetch(`https://groups.roblox.com/v1/users/${robloxId}/groups/roles`);
   if (!groupsRes.ok) throw new Error(`Roblox groups fetch failed: ${groupsRes.status}`);
@@ -121,8 +119,6 @@ async function fetchRobloxProfileDetails(robloxId) {
     displayName: user.displayName,
     created: user.created, // ISO string
     hasVerifiedBadge: user.hasVerifiedBadge,
-    badges: badgesData.data ? badgesData.data.map(b => b.name) : [],
-    badgeCountIsCapped: badgesData.data ? badgesData.data.length >= 100 : false, // API caps at 100/page; true count may be higher
     groups: groupsData.data
       ? groupsData.data.map(g => ({ name: g.group.name, role: g.role.name }))
       : [],
