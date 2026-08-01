@@ -52,6 +52,27 @@ async function setGuildRole(guildId, roleId) {
   await db.collection('guildConfig').doc(guildId).set({ verifiedRoleId: roleId }, { merge: true });
 }
 
+// Persist Discord <-> Roblox link. Called at the moment role assign succeeds.
+// merge:true so re-verifying overwrites cleanly instead of erroring on existing doc.
+async function saveVerifiedUser(discordId, { robloxId, robloxUsername, guildId }) {
+  await db.collection('verifiedUsers').doc(discordId).set({
+    robloxId,
+    robloxUsername,
+    verifiedAt: Date.now(),
+    guildId,
+  }, { merge: true });
+}
+
+async function getVerifiedUser(discordId) {
+  const snap = await db.collection('verifiedUsers').doc(discordId).get();
+  if (!snap.exists) return null;
+  return snap.data();
+}
+
+async function removeVerifiedUser(discordId) {
+  await db.collection('verifiedUsers').doc(discordId).delete();
+}
+
 // Fetches Roblox user id from username, then their profile description (blurb).
 async function fetchRobloxDescription(username) {
   const userRes = await fetch('https://users.roblox.com/v1/usernames/users', {
@@ -97,5 +118,8 @@ module.exports = {
   setGuildRole,
   fetchRobloxDescription,
   descriptionContainsCode,
+  saveVerifiedUser,
+  getVerifiedUser,
+  removeVerifiedUser,
   EXPIRY_MS,
 };
