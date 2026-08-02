@@ -150,6 +150,17 @@ async function getProduct(productId) {
   return { id: doc.id, ...doc.data() };
 }
 
+// Fetches every product belonging to one type, for a guild. Used by
+// /product view's product-level Prev/Next pagination.
+async function listProductsByType(guildId, typeId) {
+  const snap = await db
+    .collection('products')
+    .where('guildId', '==', guildId)
+    .where('typeId', '==', typeId)
+    .get();
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+}
+
 async function saveProduct(productId, data) {
   await db.collection('products').doc(productId).set(data);
 }
@@ -162,5 +173,6 @@ module.exports = {
   getProductTypeById,
   createOrSyncProductTypeForum,
   getProduct,
+  listProductsByType,
   saveProduct,
 };
