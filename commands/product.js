@@ -20,6 +20,7 @@ const {
   getProduct,
   listProductsByType,
   saveProduct,
+  deleteProduct,
 } = require('../utils/products.js');
 
 // 15 minutes -- long enough for an admin to fill multi-step forms without
@@ -65,6 +66,14 @@ module.exports = {
       sub
         .setName('view')
         .setDescription('Browse all products by type')
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('delete')
+        .setDescription('Delete a product')
+        .addStringOption(opt =>
+          opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
+        )
     ),
 
   // Read by utils/logger.js -- see verify.js for the same pattern/comment.
@@ -74,6 +83,7 @@ module.exports = {
       createtype: { label: 'Product — Type Created', fields: ['discordUser', 'typeName', 'forumChannel'] },
       sendpost: { label: 'Product — Post Sent', fields: ['discordUser', 'productId', 'forumChannel'] },
       view: { label: 'Product — Browsed', fields: ['discordUser'] },
+      delete: { label: 'Product — Deleted', fields: ['discordUser', 'productId', 'productName'] },
     },
   },
 
@@ -88,6 +98,7 @@ module.exports = {
     if (sub === 'createtype') return handleCreateType(interaction);
     if (sub === 'sendpost') return handleSendPost(interaction);
     if (sub === 'view') return handleView(interaction);
+    if (sub === 'delete') return handleDelete(interaction);
   },
 };
 
@@ -476,6 +487,15 @@ async function handleSendPost(interaction) {
     fields: { discordUser: interaction.user, productId, forumChannel },
   });
 
+  // Save the created thread id back onto the product so /product delete can
+  // clean it up later. Best-effort -- if this write fails, the post itself
+  // already succeeded, so we don't fail the command over it.
+  try {
+    await saveProduct(productId, { ...product, forumThreadId: thread.id });
+  } catch (err) {
+    console.error('Failed to save forumThreadId onto product (post itself succeeded):', err);
+  }
+
   return interaction.editReply({ content: `Produk **${product.name}** berhasil diposting: ${thread}` });
 }
 
@@ -622,4 +642,107 @@ async function handleView(interaction) {
       // message may have been deleted by then; nothing more to do
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// /product delete
+// ---------------------------------------------------------------------------
+async function handleDelete(interaction) {
+  if (!requireAdmin(interaction)) {
+    return interaction.reply({
+      content: 'You need **Administrator** permission to do that.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const productId = interaction.options.getString('product_uuid', true).trim();
+
+  // showModal() must be the very first response to this interaction -- no
+  // Firestore read before it (same cold-start guard as /verify unverify).
+  // The "does this product even exist" check happens after the modal is
+  // submitted instead, inside modalSubmit's own fresh 15-minute ack window.
+  const modal = new ModalBuilder()
+    .setCustomId('product_delete_modal')
+    .setTitle('Confirm Delete');
+
+  const confirmInput = new TextInputBuilder()
+    .setCustomId('confirm_uuid')
+    .setLabel('Ketik ulang UUID produk untuk konfirmasi')
+    .setPlaceholder(productId)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(confirmInput));
+  await interaction.showModal(modal);
+
+  let modalSubmit;
+  try {
+    modalSubmit = await interaction.awaitModalSubmit({
+      time: 2 * 60 * 1000,
+      filter: (i) => i.customId === 'product_delete_modal' && i.user.id === interaction.user.id,
+    });
+  } catch (err) {
+    if (err?.code !== 'InteractionCollectorError') {
+      console.error('Product delete modal submit error:', err);
+    }
+    return;
+  }
+
+  await modalSubmit.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const product = await getProduct(productId);
+  if (!product) {
+    await logCommandActivity(interaction, {
+      subcommand: 'delete',
+      success: false,
+      fields: { discordUser: interaction.user, productId },
+      note: 'Product UUID not found.',
+    });
+    return modalSubmit.editReply({ content: `Produk dengan ID \`${productId}\` tidak ditemukan.` });
+  }
+
+  const typed = modalSubmit.fields.getTextInputValue('confirm_uuid').trim();
+  if (typed !== productId) {
+    return modalSubmit.editReply({
+      content: `UUID tidak cocok. Kamu ketik \`${typed}\`, seharusnya \`${productId}\`. Jalankan \`/product delete\` lagi untuk mengulang.`,
+    });
+  }
+
+  // Best-effort forum thread cleanup -- a missing channel/thread (already
+  // deleted manually, or sendpost was never run for this product) shouldn't
+  // block deleting the underlying product record.
+  if (product.forumThreadId && product.typeForumId) {
+    try {
+      const forumChannel = await interaction.guild.channels.fetch(product.typeForumId).catch(() => null);
+      if (forumChannel) {
+        const thread = await forumChannel.threads.fetch(product.forumThreadId).catch(() => null);
+        if (thread) {
+          await thread.delete();
+        }
+      }
+    } catch (err) {
+      console.error('Failed to delete forum thread during product delete (continuing anyway):', err);
+    }
+  }
+
+  try {
+    await deleteProduct(productId);
+  } catch (err) {
+    console.error('Failed to delete product from Firestore:', err);
+    await logCommandActivity(interaction, {
+      subcommand: 'delete',
+      success: false,
+      fields: { discordUser: interaction.user, productId, productName: product.name },
+      note: 'Firestore delete failed.',
+    });
+    return modalSubmit.editReply({ content: 'Gagal menghapus produk dari database. Coba lagi.' });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'delete',
+    success: true,
+    fields: { discordUser: interaction.user, productId, productName: product.name },
+  });
+
+  return modalSubmit.editReply({ content: `Produk **${product.name}** (\`${productId}\`) berhasil dihapus.` });
 }
