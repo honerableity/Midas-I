@@ -305,7 +305,14 @@ async function handleCreate(interaction) {
   const selectedTypeId = typeSelectInteraction.values[0];
   const selectedType = types.find((t) => t.id === selectedTypeId);
 
-  await typeSelectInteraction.deferUpdate();
+  try {
+    await typeSelectInteraction.deferUpdate();
+  } catch (err) {
+    // Token can go stale (10062 Unknown interaction) -- the save below
+    // doesn't depend on this ack succeeding, so log and continue instead of
+    // letting it bubble up and kill the whole command.
+    console.error('typeSelectInteraction.deferUpdate() failed (continuing anyway):', err.message || err);
+  }
 
   const productId = uuidv4();
 
@@ -538,8 +545,11 @@ async function handleEdit(interaction) {
   }
 
   // Pre-select the product's current type in the dropdown so the admin isn't
-  // forced to re-pick the same thing every edit -- Discord select menus
-  // support a default via `.setDefault(true)` per option.
+  // forced to re-pick the same thing every edit. A separate "keep current"
+  // button sits alongside it because some Discord clients don't fire a new
+  // component event when you click a select option that's already marked
+  // `default: true` -- without this escape hatch, picking the same type again
+  // could silently hang until the 15-minute timeout.
   const selectMenu = new StringSelectMenuBuilder()
     .setCustomId('product_edit_type_select')
     .setPlaceholder('Pilih jenis produk')
@@ -552,18 +562,31 @@ async function handleEdit(interaction) {
     );
 
   const selectRow = new ActionRowBuilder().addComponents(selectMenu);
+  const keepTypeRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('product_edit_keep_type')
+      .setLabel(`Simpan dengan jenis "${product.type}"`)
+      .setStyle(ButtonStyle.Secondary)
+  );
 
   await modal2Submit.editReply({
-    content: 'Terakhir, pilih jenis produk (default: jenis saat ini):',
-    components: [selectRow],
+    content: 'Terakhir, pilih jenis produk (atau klik tombol untuk tetap pakai jenis saat ini):',
+    components: [selectRow, keepTypeRow],
   });
 
-  let typeSelectInteraction;
+  let selectedTypeId;
+  let ackInteraction;
   try {
-    typeSelectInteraction = await modal2Submit.channel.awaitMessageComponent({
-      filter: (i) => i.customId === 'product_edit_type_select' && i.user.id === interaction.user.id,
+    const componentInteraction = await modal2Submit.channel.awaitMessageComponent({
+      filter: (i) =>
+        (i.customId === 'product_edit_type_select' || i.customId === 'product_edit_keep_type') &&
+        i.user.id === interaction.user.id,
       time: STEP_TIMEOUT_MS,
     });
+    ackInteraction = componentInteraction;
+    selectedTypeId = componentInteraction.customId === 'product_edit_keep_type'
+      ? product.typeId
+      : componentInteraction.values[0];
   } catch (err) {
     if (err?.code !== 'InteractionCollectorError') {
       console.error('Product edit type-select error:', err);
@@ -576,10 +599,17 @@ async function handleEdit(interaction) {
     return;
   }
 
-  const selectedTypeId = typeSelectInteraction.values[0];
   const selectedType = types.find((t) => t.id === selectedTypeId);
 
-  await typeSelectInteraction.deferUpdate();
+  try {
+    await ackInteraction.deferUpdate();
+  } catch (err) {
+    // Root cause of the earlier crash report: this token can go stale
+    // (10062 Unknown interaction). The save below doesn't depend on this ack
+    // succeeding, so log and continue instead of letting it bubble up and
+    // kill the whole command.
+    console.error('ackInteraction.deferUpdate() failed (continuing anyway):', err.message || err);
+  }
 
   // Overwrite the whole doc but explicitly carry forward fields the edit
   // form doesn't touch (forumThreadId/typeForumId/createdBy/createdAt) --
