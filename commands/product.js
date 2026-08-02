@@ -438,7 +438,26 @@ async function handleEdit(interaction) {
     new ActionRowBuilder().addComponents(creatorInput),
   );
 
-  await interaction.showModal(modal1);
+  // The getProduct() read above (needed to prefill this modal) eats into the
+  // 3-second ack window -- on a cold Firestore connection (same class of
+  // issue /verify start's deferReply() guards against) this token can expire
+  // before showModal() even runs. Modals can't follow a deferReply(), so the
+  // fetch-before-modal order is unavoidable here; this catch just makes the
+  // failure mode a clean retry message instead of a process-killing crash.
+  try {
+    await interaction.showModal(modal1);
+  } catch (err) {
+    console.error('Product edit showModal(modal1) failed (likely cold-start ack timeout):', err.message || err);
+    try {
+      await interaction.reply({
+        content: `Waktu habis (koneksi database lambat saat startup). Jalankan \`/product edit ${productId}\` lagi -- percobaan kedua biasanya cepat.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch {
+      // interaction token is fully dead at this point, nothing left to do
+    }
+    return;
+  }
 
   let modal1Submit;
   try {
