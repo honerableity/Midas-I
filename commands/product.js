@@ -64,6 +64,14 @@ module.exports = {
     )
     .addSubcommand(sub =>
       sub
+        .setName('edit')
+        .setDescription('Edit an existing product listing')
+        .addStringOption(opt =>
+          opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
         .setName('view')
         .setDescription('Browse all products by type')
     )
@@ -82,6 +90,7 @@ module.exports = {
       create: { label: 'Product — Created', fields: ['discordUser', 'productId', 'productName'] },
       createtype: { label: 'Product — Type Created', fields: ['discordUser', 'typeName', 'forumChannel'] },
       sendpost: { label: 'Product — Post Sent', fields: ['discordUser', 'productId', 'forumChannel'] },
+      edit: { label: 'Product — Edited', fields: ['discordUser', 'productId', 'productName'] },
       view: { label: 'Product — Browsed', fields: ['discordUser'] },
       delete: { label: 'Product — Deleted', fields: ['discordUser', 'productId', 'productName'] },
     },
@@ -97,6 +106,7 @@ module.exports = {
     if (sub === 'create') return handleCreate(interaction);
     if (sub === 'createtype') return handleCreateType(interaction);
     if (sub === 'sendpost') return handleSendPost(interaction);
+    if (sub === 'edit') return handleEdit(interaction);
     if (sub === 'view') return handleView(interaction);
     if (sub === 'delete') return handleDelete(interaction);
   },
@@ -349,6 +359,288 @@ async function handleCreate(interaction) {
 }
 
 // ---------------------------------------------------------------------------
+// /product edit
+// ---------------------------------------------------------------------------
+async function handleEdit(interaction) {
+  if (!requireAdmin(interaction)) {
+    return interaction.reply({
+      content: 'You need **Administrator** permission to do that.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const productId = interaction.options.getString('product_uuid', true).trim();
+
+  // Lookup must happen before showModal() since the modal needs the existing
+  // values to prefill -- this breaks the "showModal() first" cold-start rule
+  // used elsewhere, so we eat the risk here deliberately: if this lookup is
+  // slow enough to blow the 3s ack window, the interaction just fails and the
+  // admin re-runs the command. Acceptable tradeoff since prefilled fields are
+  // the whole point of /product edit.
+  const product = await getProduct(productId);
+  if (!product) {
+    await logCommandActivity(interaction, {
+      subcommand: 'edit',
+      success: false,
+      fields: { discordUser: interaction.user, productId },
+      note: 'Product UUID not found.',
+    });
+    return interaction.reply({
+      content: `Produk dengan ID \`${productId}\` tidak ditemukan.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const modal1 = new ModalBuilder()
+    .setCustomId('product_edit_modal_1')
+    .setTitle('Edit Product (1/2)');
+
+  const nameInput = new TextInputBuilder()
+    .setCustomId('product_name')
+    .setLabel('Nama produk')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.name)
+    .setRequired(true);
+
+  const descInput = new TextInputBuilder()
+    .setCustomId('product_description')
+    .setLabel('Deskripsi')
+    .setStyle(TextInputStyle.Paragraph)
+    .setValue(product.description)
+    .setRequired(true);
+
+  const priceInput = new TextInputBuilder()
+    .setCustomId('product_price')
+    .setLabel('Harga')
+    .setPlaceholder('cth: 25000 atau Rp25.000')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.price)
+    .setRequired(true);
+
+  const creatorInput = new TextInputBuilder()
+    .setCustomId('product_creator')
+    .setLabel('Kreator (kosongkan jika kamu sendiri)')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.creator || '')
+    .setRequired(false);
+
+  modal1.addComponents(
+    new ActionRowBuilder().addComponents(nameInput),
+    new ActionRowBuilder().addComponents(descInput),
+    new ActionRowBuilder().addComponents(priceInput),
+    new ActionRowBuilder().addComponents(creatorInput),
+  );
+
+  await interaction.showModal(modal1);
+
+  let modal1Submit;
+  try {
+    modal1Submit = await interaction.awaitModalSubmit({
+      time: STEP_TIMEOUT_MS,
+      filter: (i) => i.customId === 'product_edit_modal_1' && i.user.id === interaction.user.id,
+    });
+  } catch (err) {
+    if (err?.code !== 'InteractionCollectorError') {
+      console.error('Product edit modal 1 submit error:', err);
+    }
+    return;
+  }
+
+  const productName = modal1Submit.fields.getTextInputValue('product_name').trim();
+  const productDescription = modal1Submit.fields.getTextInputValue('product_description').trim();
+  const productPrice = modal1Submit.fields.getTextInputValue('product_price').trim();
+  const productCreatorRaw = modal1Submit.fields.getTextInputValue('product_creator').trim();
+  const productCreator = productCreatorRaw || interaction.user.username;
+
+  const continueRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('product_edit_continue')
+      .setLabel('Lanjutkan (2/2)')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  await modal1Submit.reply({
+    content: 'Langkah 1 tersimpan. Klik tombol di bawah buat lanjut ke langkah 2.',
+    components: [continueRow],
+    flags: MessageFlags.Ephemeral,
+  });
+
+  let btnInteraction;
+  try {
+    btnInteraction = await modal1Submit.channel.awaitMessageComponent({
+      filter: (i) => i.customId === 'product_edit_continue' && i.user.id === interaction.user.id,
+      time: STEP_TIMEOUT_MS,
+    });
+  } catch (err) {
+    if (err?.code !== 'InteractionCollectorError') {
+      console.error('Product edit continue-button error:', err);
+    }
+    try {
+      await modal1Submit.editReply({ content: `Waktu habis. Jalankan \`/product edit ${productId}\` lagi.`, components: [] });
+    } catch {
+      // interaction may already be too old to edit
+    }
+    return;
+  }
+
+  const modal2 = new ModalBuilder()
+    .setCustomId('product_edit_modal_2')
+    .setTitle('Edit Product (2/2)');
+
+  const fileLinkInput = new TextInputBuilder()
+    .setCustomId('product_file_link')
+    .setLabel('Link file produk')
+    .setPlaceholder('CDN Discord, catbox.moe, Drive, Mega.nz, dll')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.fileLink)
+    .setRequired(true);
+
+  const reviewMediaInput = new TextInputBuilder()
+    .setCustomId('product_review_media')
+    .setLabel('Video/Gambar Review Produk')
+    .setPlaceholder('Link video atau gambar review')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.reviewMedia || '')
+    .setRequired(true);
+
+  modal2.addComponents(
+    new ActionRowBuilder().addComponents(fileLinkInput),
+    new ActionRowBuilder().addComponents(reviewMediaInput),
+  );
+
+  await btnInteraction.showModal(modal2);
+
+  let modal2Submit;
+  try {
+    modal2Submit = await btnInteraction.awaitModalSubmit({
+      time: STEP_TIMEOUT_MS,
+      filter: (i) => i.customId === 'product_edit_modal_2' && i.user.id === interaction.user.id,
+    });
+  } catch (err) {
+    if (err?.code !== 'InteractionCollectorError') {
+      console.error('Product edit modal 2 submit error:', err);
+    }
+    return;
+  }
+
+  const productFileLink = modal2Submit.fields.getTextInputValue('product_file_link').trim();
+  const productReviewMedia = modal2Submit.fields.getTextInputValue('product_review_media').trim();
+
+  await modal2Submit.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Re-fetch types fresh (not the pre-modal snapshot) in case a type was
+  // renamed/added/removed during the multi-minute edit flow.
+  const types = await listProductTypes(interaction.guildId);
+  if (types.length === 0) {
+    return modal2Submit.editReply({
+      content: 'Belum ada jenis produk yang terdaftar. Minta admin jalankan `/product createtype` dulu.',
+    });
+  }
+
+  // Pre-select the product's current type in the dropdown so the admin isn't
+  // forced to re-pick the same thing every edit -- Discord select menus
+  // support a default via `.setDefault(true)` per option.
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('product_edit_type_select')
+    .setPlaceholder('Pilih jenis produk')
+    .addOptions(
+      types.slice(0, MAX_SELECT_OPTIONS).map((t) => ({
+        label: t.name,
+        value: t.id,
+        default: t.id === product.typeId,
+      }))
+    );
+
+  const selectRow = new ActionRowBuilder().addComponents(selectMenu);
+
+  await modal2Submit.editReply({
+    content: 'Terakhir, pilih jenis produk (default: jenis saat ini):',
+    components: [selectRow],
+  });
+
+  let typeSelectInteraction;
+  try {
+    typeSelectInteraction = await modal2Submit.channel.awaitMessageComponent({
+      filter: (i) => i.customId === 'product_edit_type_select' && i.user.id === interaction.user.id,
+      time: STEP_TIMEOUT_MS,
+    });
+  } catch (err) {
+    if (err?.code !== 'InteractionCollectorError') {
+      console.error('Product edit type-select error:', err);
+    }
+    try {
+      await modal2Submit.editReply({ content: `Waktu habis memilih jenis. Jalankan \`/product edit ${productId}\` lagi.`, components: [] });
+    } catch {
+      // interaction may already be too old to edit
+    }
+    return;
+  }
+
+  const selectedTypeId = typeSelectInteraction.values[0];
+  const selectedType = types.find((t) => t.id === selectedTypeId);
+
+  await typeSelectInteraction.deferUpdate();
+
+  // Overwrite the whole doc but explicitly carry forward fields the edit
+  // form doesn't touch (forumThreadId/typeForumId/createdBy/createdAt) --
+  // saveProduct does a plain .set(), not a merge, so anything left out here
+  // would be silently wiped.
+  const updatedData = {
+    ...product,
+    productId,
+    name: productName,
+    description: productDescription,
+    price: productPrice,
+    fileLink: productFileLink,
+    reviewMedia: productReviewMedia,
+    creator: productCreator,
+    type: selectedType.name,
+    typeId: selectedType.id,
+    // Only overwrite typeForumId if the type actually changed -- keeps a
+    // stale/removed forum reference from a *different* type change wiping a
+    // still-valid one when the admin picks the same type again.
+    typeForumId: selectedType.id === product.typeId ? product.typeForumId : (selectedType.forumChannelId || null),
+    updatedAt: Date.now(),
+  };
+
+  try {
+    await saveProduct(productId, updatedData);
+  } catch (err) {
+    console.error('Failed to save edited product to Firestore:', err);
+    await logCommandActivity(interaction, {
+      subcommand: 'edit',
+      success: false,
+      fields: { discordUser: interaction.user, productId, productName },
+      note: 'Firestore write failed.',
+    });
+    return modal2Submit.editReply({ content: 'Gagal menyimpan perubahan produk ke database. Coba lagi.', components: [] });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'edit',
+    success: true,
+    fields: { discordUser: interaction.user, productId, productName },
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('Produk Berhasil Diedit')
+    .setColor(0x57f287)
+    .addFields(
+      { name: 'Nama Produk', value: productName },
+      { name: 'ID Produk', value: `\`${productId}\`` },
+      { name: 'Jenis', value: selectedType.name, inline: true },
+      { name: 'Harga', value: productPrice, inline: true },
+      { name: 'Kreator', value: productCreator, inline: true },
+    );
+
+  const postNote = updatedData.forumThreadId
+    ? ' Jalankan `/product sendpost` untuk update post forum-nya juga.'
+    : '';
+
+  return modal2Submit.editReply({ content: `Produk berhasil diedit!${postNote}`, embeds: [embed], components: [] });
+}
+
+// ---------------------------------------------------------------------------
 // /product createtype
 // ---------------------------------------------------------------------------
 async function handleCreateType(interaction) {
@@ -411,13 +703,16 @@ async function handleSendPost(interaction) {
 
   const product = await getProduct(productId);
   if (!product) {
+    // Product doc gone (deleted via /product delete already cleans its own
+    // thread). No productId means no stored forumThreadId to look up here,
+    // so there's nothing left to clean -- just report not-found.
     await logCommandActivity(interaction, {
       subcommand: 'sendpost',
       success: false,
       fields: { discordUser: interaction.user, productId },
       note: 'Product UUID not found.',
     });
-    return interaction.editReply({ content: `Produk dengan ID \`${productId}\` tidak ditemukan.` });
+    return interaction.editReply({ content: `Produk dengan ID \`${productId}\` tidak ditemukan. Kalau produk ini baru dihapus, post forum-nya seharusnya sudah ikut terhapus lewat \`/product delete\`.` });
   }
 
   if (!product.typeForumId) {
@@ -461,42 +756,80 @@ async function handleSendPost(interaction) {
     embed.addFields({ name: 'Video/Gambar Review', value: product.reviewMedia });
   }
 
+  // If this product already has a live thread (previous sendpost, possibly
+  // followed by /product edit), update that thread in place instead of
+  // spawning a duplicate -- this is what makes sendpost double as the "push
+  // my edit live" step. Missing/deleted thread falls through to create-new.
+  let existingThread = null;
+  if (product.forumThreadId) {
+    existingThread = await forumChannel.threads.fetch(product.forumThreadId).catch(() => null);
+  }
+
   let thread;
-  try {
-    thread = await forumChannel.threads.create({
-      name: product.name,
-      message: {
-        content: product.description,
-        embeds: [embed],
-      },
-    });
-  } catch (err) {
-    console.error('Forum post creation failed:', err);
-    await logCommandActivity(interaction, {
-      subcommand: 'sendpost',
-      success: false,
-      fields: { discordUser: interaction.user, productId },
-      note: 'Bot error while creating forum post.',
-    });
-    return interaction.editReply({ content: 'Bot error saat membuat post di forum. Cek permission bot di channel forum tersebut.' });
+  let wasUpdate = false;
+
+  if (existingThread) {
+    try {
+      if (existingThread.name !== product.name) {
+        await existingThread.setName(product.name);
+      }
+      const starterMessage = await existingThread.fetchStarterMessage().catch(() => null);
+      if (!starterMessage) {
+        // Thread exists but its starter message is gone (manually deleted) --
+        // a forum thread can't have its content-less starter re-created, so
+        // fall back to a fresh thread instead of leaving an empty post.
+        throw new Error('Starter message missing, cannot edit in place.');
+      }
+      await starterMessage.edit({ content: product.description, embeds: [embed] });
+      thread = existingThread;
+      wasUpdate = true;
+    } catch (err) {
+      console.error('Failed to edit existing forum post in place, falling back to new thread:', err);
+      existingThread = null;
+    }
+  }
+
+  if (!existingThread) {
+    try {
+      thread = await forumChannel.threads.create({
+        name: product.name,
+        message: {
+          content: product.description,
+          embeds: [embed],
+        },
+      });
+    } catch (err) {
+      console.error('Forum post creation failed:', err);
+      await logCommandActivity(interaction, {
+        subcommand: 'sendpost',
+        success: false,
+        fields: { discordUser: interaction.user, productId },
+        note: 'Bot error while creating forum post.',
+      });
+      return interaction.editReply({ content: 'Bot error saat membuat post di forum. Cek permission bot di channel forum tersebut.' });
+    }
   }
 
   await logCommandActivity(interaction, {
     subcommand: 'sendpost',
     success: true,
     fields: { discordUser: interaction.user, productId, forumChannel },
+    note: wasUpdate ? 'Updated existing post in place.' : 'Created new post.',
   });
 
-  // Save the created thread id back onto the product so /product delete can
-  // clean it up later. Best-effort -- if this write fails, the post itself
-  // already succeeded, so we don't fail the command over it.
-  try {
-    await saveProduct(productId, { ...product, forumThreadId: thread.id });
-  } catch (err) {
-    console.error('Failed to save forumThreadId onto product (post itself succeeded):', err);
+  // Save the thread id back onto the product so future sendpost/delete calls
+  // know where the post lives. Best-effort -- if this write fails, the post
+  // itself already succeeded, so we don't fail the command over it.
+  if (!wasUpdate) {
+    try {
+      await saveProduct(productId, { ...product, forumThreadId: thread.id });
+    } catch (err) {
+      console.error('Failed to save forumThreadId onto product (post itself succeeded):', err);
+    }
   }
 
-  return interaction.editReply({ content: `Produk **${product.name}** berhasil diposting: ${thread}` });
+  const verb = wasUpdate ? 'diperbarui' : 'diposting';
+  return interaction.editReply({ content: `Produk **${product.name}** berhasil ${verb}: ${thread}` });
 }
 
 // ---------------------------------------------------------------------------
