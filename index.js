@@ -1,6 +1,5 @@
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { Client, GatewayIntentBits, Collection, MessageFlags } = require('discord.js');
 require('dotenv').config();
 
@@ -26,41 +25,25 @@ for (const file of commandFiles) {
   client.commands.set(cmd.data.name, cmd);
 }
 
-// Auto-redeploy slash commands if anything in commands/ changed since last boot.
-// Hash is stored on disk (not Firestore) since it only needs to survive this
-// container's lifetime, not across wipes -- a wipe means node_modules is gone
-// too, so a redeploy on next boot is harmless and correct anyway.
-function getCommandsHash() {
-  const combined = commandFiles
-    .sort()
-    .map((f) => fs.readFileSync(path.join(commandsDir, f), 'utf8'))
-    .join('\n');
-  return crypto.createHash('sha256').update(combined).digest('hex');
-}
-
-function maybeDeployCommands() {
-  const hashFile = path.join(__dirname, '.commands-hash');
-  const currentHash = getCommandsHash();
-  const previousHash = fs.existsSync(hashFile) ? fs.readFileSync(hashFile, 'utf8').trim() : null;
-
-  if (currentHash === previousHash) {
-    console.log('Commands unchanged, skipping deploy.');
-    return;
-  }
-
-  console.log('Command files changed (or first boot), deploying slash commands...');
+// Always redeploy slash commands on boot. Previously skipped when a
+// content-hash matched a stored .commands-hash file -- dropped because
+// Discloud's file container is paywalled/unreachable, so a stale hash file
+// left over from a prior boot can never be manually cleared, causing "unchanged"
+// false positives even after real command edits. Deploying every boot costs
+// one extra Discord API call; harmless on free tier.
+function deployCommands() {
+  console.log('Deploying slash commands...');
   const { execFileSync } = require('child_process');
   try {
     const output = execFileSync('node', [path.join(__dirname, 'deploy-commands.js')], { encoding: 'utf8' });
     console.log(output.trim());
-    fs.writeFileSync(hashFile, currentHash);
   } catch (err) {
     console.error('Auto-deploy failed:', err.stdout || err.message || err);
     console.error('Bot will still start, but slash commands may be out of date. Run `node deploy-commands.js` manually.');
   }
 }
 
-maybeDeployCommands();
+deployCommands();
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
