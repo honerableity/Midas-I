@@ -165,6 +165,10 @@ async function saveProduct(productId, data) {
   await db.collection('products').doc(productId).set(data);
 }
 
+async function deleteProduct(productId) {
+  await db.collection('products').doc(productId).delete();
+}
+
 module.exports = {
   slugifyChannelName,
   resolveProductCategory,
@@ -175,4 +179,5 @@ module.exports = {
   getProduct,
   listProductsByType,
   saveProduct,
+  deleteProduct,
 };
