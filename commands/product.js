@@ -18,6 +18,7 @@ const {
   listProductTypes,
   createOrSyncProductTypeForum,
   getProduct,
+  listProductsByType,
   saveProduct,
 } = require('../utils/products.js');
 
@@ -59,6 +60,11 @@ module.exports = {
         .addStringOption(opt =>
           opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
         )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('view')
+        .setDescription('Browse all products by type')
     ),
 
   // Read by utils/logger.js -- see verify.js for the same pattern/comment.
@@ -67,6 +73,7 @@ module.exports = {
       create: { label: 'Product — Created', fields: ['discordUser', 'productId', 'productName'] },
       createtype: { label: 'Product — Type Created', fields: ['discordUser', 'typeName', 'forumChannel'] },
       sendpost: { label: 'Product — Post Sent', fields: ['discordUser', 'productId', 'forumChannel'] },
+      view: { label: 'Product — Browsed', fields: ['discordUser'] },
     },
   },
 
@@ -80,6 +87,7 @@ module.exports = {
     if (sub === 'create') return handleCreate(interaction);
     if (sub === 'createtype') return handleCreateType(interaction);
     if (sub === 'sendpost') return handleSendPost(interaction);
+    if (sub === 'view') return handleView(interaction);
   },
 };
 
@@ -469,4 +477,149 @@ async function handleSendPost(interaction) {
   });
 
   return interaction.editReply({ content: `Produk **${product.name}** berhasil diposting: ${thread}` });
+}
+
+// ---------------------------------------------------------------------------
+// /product view
+// ---------------------------------------------------------------------------
+async function handleView(interaction) {
+  // Public catalog browse -- no admin check, non-ephemeral, same visibility
+  // rationale as /verify profile.
+  await interaction.deferReply();
+
+  const types = await listProductTypes(interaction.guildId);
+  types.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (types.length === 0) {
+    return interaction.editReply({ content: 'Belum ada jenis produk yang terdaftar.' });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'view',
+    success: true,
+    fields: { discordUser: interaction.user },
+  });
+
+  // Products for each type are loaded lazily and cached in this closure as
+  // the user browses, so switching types repeatedly doesn't re-query
+  // Firestore every time -- only the first visit to each type pays for it.
+  const productsByTypeCache = new Map();
+
+  async function getProductsForType(typeIndex) {
+    const type = types[typeIndex];
+    if (!productsByTypeCache.has(type.id)) {
+      const products = await listProductsByType(interaction.guildId, type.id);
+      products.sort((a, b) => a.name.localeCompare(b.name));
+      productsByTypeCache.set(type.id, products);
+    }
+    return productsByTypeCache.get(type.id);
+  }
+
+  // Pagination state lives in this closure per response -- one browse
+  // session, one collector. Switching type always resets productIndex to 0
+  // (a product index from one type has no meaning in another).
+  const state = { typeIndex: 0, productIndex: 0 };
+
+  async function buildEmbed() {
+    const type = types[state.typeIndex];
+    const products = await getProductsForType(state.typeIndex);
+
+    const embed = new EmbedBuilder()
+      .setColor(0x00b0f4)
+      .setFooter({ text: `Jenis ${state.typeIndex + 1}/${types.length} — ${type.name}` });
+
+    if (products.length === 0) {
+      embed
+        .setTitle(type.name)
+        .setDescription('Belum ada produk di jenis ini.');
+      return embed;
+    }
+
+    const product = products[state.productIndex];
+
+    embed
+      .setTitle(product.name)
+      .setDescription(product.description)
+      .addFields(
+        { name: 'Harga', value: product.price, inline: true },
+        { name: 'Jenis', value: product.type, inline: true },
+        { name: 'Kreator', value: product.creator, inline: true },
+        { name: 'ID Produk', value: `\`${product.productId}\`` },
+      );
+
+    const isImageUrl = /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(product.reviewMedia || '');
+    if (isImageUrl) {
+      embed.setImage(product.reviewMedia);
+    } else if (product.reviewMedia) {
+      embed.addFields({ name: 'Video/Gambar Review', value: product.reviewMedia });
+    }
+
+    embed.setFooter({
+      text: `Jenis ${state.typeIndex + 1}/${types.length} — ${type.name} · Produk ${state.productIndex + 1}/${products.length}`,
+    });
+
+    return embed;
+  }
+
+  async function buildComponents(disabled = false) {
+    const products = await getProductsForType(state.typeIndex);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('product_view_type_prev')
+        .setLabel('◀◀ Jenis')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || types.length <= 1),
+      new ButtonBuilder()
+        .setCustomId('product_view_product_prev')
+        .setLabel('◀ Produk')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || products.length <= 1 || state.productIndex === 0),
+      new ButtonBuilder()
+        .setCustomId('product_view_product_next')
+        .setLabel('Produk ▶')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || products.length <= 1 || state.productIndex >= products.length - 1),
+      new ButtonBuilder()
+        .setCustomId('product_view_type_next')
+        .setLabel('Jenis ▶▶')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disabled || types.length <= 1),
+    );
+
+    return [row];
+  }
+
+  const message = await interaction.editReply({ embeds: [await buildEmbed()], components: await buildComponents() });
+
+  const collector = message.createMessageComponentCollector({ time: 10 * 60 * 1000 });
+
+  collector.on('collect', async (btnInteraction) => {
+    if (btnInteraction.user.id !== interaction.user.id) {
+      return btnInteraction.reply({ content: 'Only the person who ran this command can use these buttons.', flags: MessageFlags.Ephemeral });
+    }
+
+    if (btnInteraction.customId === 'product_view_type_prev') {
+      state.typeIndex = (state.typeIndex - 1 + types.length) % types.length;
+      state.productIndex = 0;
+    } else if (btnInteraction.customId === 'product_view_type_next') {
+      state.typeIndex = (state.typeIndex + 1) % types.length;
+      state.productIndex = 0;
+    } else if (btnInteraction.customId === 'product_view_product_prev') {
+      state.productIndex = Math.max(0, state.productIndex - 1);
+    } else if (btnInteraction.customId === 'product_view_product_next') {
+      const products = await getProductsForType(state.typeIndex);
+      state.productIndex = Math.min(products.length - 1, state.productIndex + 1);
+    }
+
+    await btnInteraction.update({ embeds: [await buildEmbed()], components: await buildComponents() });
+  });
+
+  collector.on('end', async () => {
+    try {
+      await interaction.editReply({ components: await buildComponents(true) });
+    } catch {
+      // message may have been deleted by then; nothing more to do
+    }
+  });
 }
