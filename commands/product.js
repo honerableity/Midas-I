@@ -108,6 +108,14 @@ module.exports = {
         .addStringOption(opt =>
           opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
         )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('get')
+        .setDescription('Get the file link of a product you own, sent to your DM')
+        .addStringOption(opt =>
+          opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
+        )
     ),
 
   // Read by utils/logger.js -- see verify.js for the same pattern/comment.
@@ -121,6 +129,7 @@ module.exports = {
       delete: { label: 'Product — Deleted', fields: ['discordUser', 'productId', 'productName'] },
       give: { label: 'Product — Given', fields: ['discordUser', 'targetUser', 'productId', 'productName'] },
       revoke: { label: 'Product — Revoked', fields: ['discordUser', 'targetUser', 'productId', 'productName'] },
+      get: { label: 'Product — File Link Requested', fields: ['discordUser', 'productId', 'productName'] },
     },
   },
 
@@ -139,6 +148,7 @@ module.exports = {
     if (sub === 'delete') return handleDelete(interaction);
     if (sub === 'give') return handleGive(interaction);
     if (sub === 'revoke') return handleRevoke(interaction);
+    if (sub === 'get') return handleGet(interaction);
   },
 };
 
@@ -1277,4 +1287,69 @@ async function handleRevoke(interaction) {
   return interaction.editReply({
     content: `Produk **${product.name}** berhasil dicabut dari ${targetUser}.`,
   });
+}
+
+// ---------------------------------------------------------------------------
+// /product get
+// ---------------------------------------------------------------------------
+async function handleGet(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const productId = interaction.options.getString('product_uuid', true).trim();
+
+  const verifiedRecord = await getVerifiedUser(interaction.user.id);
+  if (!verifiedRecord) {
+    await logCommandActivity(interaction, {
+      subcommand: 'get',
+      success: false,
+      fields: { discordUser: interaction.user, productId },
+      note: 'Requesting user is not verified.',
+    });
+    return interaction.editReply({ content: 'You are required to verified to use this command!' });
+  }
+
+  const product = await getProduct(productId);
+  if (!product) {
+    await logCommandActivity(interaction, {
+      subcommand: 'get',
+      success: false,
+      fields: { discordUser: interaction.user, productId },
+      note: 'Product UUID not found.',
+    });
+    return interaction.editReply({ content: `Produk dengan ID \`${productId}\` tidak ditemukan.` });
+  }
+
+  if (!userOwnsProduct(product, interaction.user.id)) {
+    await logCommandActivity(interaction, {
+      subcommand: 'get',
+      success: false,
+      fields: { discordUser: interaction.user, productId, productName: product.name },
+      note: 'Requesting user does not own this product.',
+    });
+    return interaction.editReply({ content: 'You didnt owned the product!' });
+  }
+
+  try {
+    await interaction.user.send({
+      content: `**${product.name}**\nLink file: ${product.fileLink}`,
+    });
+  } catch (err) {
+    await logCommandActivity(interaction, {
+      subcommand: 'get',
+      success: false,
+      fields: { discordUser: interaction.user, productId, productName: product.name },
+      note: 'Could not DM the user (DMs likely closed).',
+    });
+    return interaction.editReply({
+      content: 'Could not DM you the file link. Please enable DMs from server members and try again.',
+    });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'get',
+    success: true,
+    fields: { discordUser: interaction.user, productId, productName: product.name },
+  });
+
+  return interaction.editReply({ content: 'Sent! Check your DMs 📬' });
 }
