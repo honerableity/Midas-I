@@ -211,6 +211,21 @@ async function revokeProductFromUser(productId, discordId) {
   await batch.commit();
 }
 
+// Fetches multiple products by id in one round trip. Used by /verify profile's
+// "Owned Products" tab, where ownedProducts[] on the verifiedUsers doc can
+// exceed Firestore's 30-item `in` query cap -- db.getAll() has no such limit,
+// it just batches individual doc reads. Missing/deleted product ids (owned
+// but since removed from the catalog) are silently skipped rather than
+// erroring, since a stale id shouldn't break the whole list.
+async function getProductsByIds(productIds) {
+  if (!productIds || productIds.length === 0) return [];
+  const refs = productIds.map((id) => db.collection('products').doc(id));
+  const docs = await db.getAll(...refs);
+  return docs
+    .filter((d) => d.exists)
+    .map((d) => ({ id: d.id, ...d.data() }));
+}
+
 module.exports = {
   slugifyChannelName,
   resolveProductCategory,
@@ -225,4 +240,5 @@ module.exports = {
   userOwnsProduct,
   giveProductToUser,
   revokeProductFromUser,
+  getProductsByIds,
 };
