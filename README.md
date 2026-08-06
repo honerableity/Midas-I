@@ -1,7 +1,13 @@
 # markotop-bot-IX
-this is only a backup
-the real file is inside the hosting so dont expect much the github will always be updated when there is new code since the hosting sadly did not support github
-there is a .env and serviceAccountKey.json in the hosting there will not be in this repository because this is a public mean for reference
+hello this is a small fun project made by me
+this is a shop manager bot
+you can host one of your own
+you just need firebase serviceAccountKey.json and .env
+if you want context on what can this bot do
+Copy and paste this to claude
+```https://github.com/honerableity/markotop-bot-IX Read all the contents of this repository and tell me all the commands that in here and sum what can it do.```
 if you find this, you struck gold :)
 
-is now public again :D
+Shop Manager V9 / Markotop Bot IX
+
+Lmfao
