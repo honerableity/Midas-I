@@ -4,4 +4,4 @@ the real file is inside the hosting so dont expect much the github will always b
 there is a .env and serviceAccountKey.json in the hosting there will not be in this repository because this is a public mean for reference
 if you find this, you struck gold :)
 
-Now private :p
+is now public again :D
