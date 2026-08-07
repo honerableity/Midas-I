@@ -17,10 +17,13 @@ const { listProductTypes, listProductsByType, getProduct } = require('../utils/p
 const {
   setTestiChannel,
   getTestiChannel,
+  setTicketCategories,
+  getTicketCategories,
   nextTicketNumber,
   createTicket,
   getTicket,
   closeTicket,
+  markTicketDeleted,
 } = require('../utils/tickets.js');
 
 const MAX_SELECT_OPTIONS = 25;
@@ -71,14 +74,14 @@ module.exports = {
       sub
         .setName('send')
         .setDescription('Send a ticket panel embed')
+        .addChannelOption(opt =>
+          opt.setName('channel').setDescription('Where to send the panel').setRequired(true).addChannelTypes(ChannelType.GuildText)
+        )
     )
     .addSubcommand(sub =>
       sub
         .setName('done')
-        .setDescription('Mark a ticket as done and post testimonial')
-        .addStringOption(opt =>
-          opt.setName('ticketchannelid').setDescription('Ticket channel ID').setRequired(true)
-        )
+        .setDescription('Mark the current ticket as done and post testimonial')
     )
     .addSubcommand(sub =>
       sub
@@ -87,13 +90,28 @@ module.exports = {
         .addChannelOption(opt =>
           opt.setName('channel').setDescription('Testimonial channel').setRequired(true).addChannelTypes(ChannelType.GuildText)
         )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('createcategory')
+        .setDescription('Create the Order/Service/Customer Service ticket categories')
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('close')
+        .setDescription('Close and delete a ticket, DM the creator')
+        .addChannelOption(opt =>
+          opt.setName('channel').setDescription('Ticket channel to close').setRequired(true).addChannelTypes(ChannelType.GuildText)
+        )
     ),
 
   logSchema: {
     subcommands: {
-      send: { label: 'Ticket — Panel Sent', fields: ['discordUser'] },
+      send: { label: 'Ticket — Panel Sent', fields: ['discordUser', 'channel'] },
       done: { label: 'Ticket — Closed', fields: ['discordUser', 'ticketChannel', 'total'] },
       settesti: { label: 'Ticket — Testimonial Channel Set', fields: ['discordUser', 'channel'] },
+      createcategory: { label: 'Ticket — Categories Created', fields: ['discordUser'] },
+      close: { label: 'Ticket — Deleted', fields: ['discordUser', 'ticketChannel'] },
     },
   },
 
@@ -107,6 +125,8 @@ module.exports = {
     if (sub === 'send') return handleSend(interaction);
     if (sub === 'done') return handleDone(interaction);
     if (sub === 'settesti') return handleSetTesti(interaction);
+    if (sub === 'createcategory') return handleCreateCategory(interaction);
+    if (sub === 'close') return handleClose(interaction);
   },
 
   // Called from index.js's global interactionCreate router for any
@@ -131,6 +151,17 @@ module.exports = {
 // ---------------------------------------------------------------------------
 async function handleSend(interaction) {
   if (!requireAdmin(interaction)) return requireAdminReply(interaction);
+
+  const targetChannel = interaction.options.getChannel('channel', true);
+
+  const botMember = interaction.guild.members.me;
+  const perms = targetChannel.permissionsFor(botMember);
+  if (!perms?.has(PermissionFlagsBits.SendMessages) || !perms?.has(PermissionFlagsBits.ViewChannel)) {
+    return interaction.reply({
+      content: `I can't send messages in ${targetChannel}. Check my permissions there.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
   const modal = new ModalBuilder()
     .setCustomId('ticket_send_modal')
@@ -178,6 +209,12 @@ async function handleSend(interaction) {
   const panelDesc = modalSubmit.fields.getTextInputValue('panel_description').trim();
   const colorRaw = modalSubmit.fields.getTextInputValue('panel_color').trim();
 
+  // Ack the modal submit immediately -- it has its own 3s window separate
+  // from the earlier showModal(). targetChannel.send() below is a network
+  // call and can push past that window, which is what caused the 10062
+  // "Unknown interaction" errors.
+  await modalSubmit.deferReply({ flags: MessageFlags.Ephemeral });
+
   let color = 0x5865f2;
   if (colorRaw) {
     const parsed = parseInt(colorRaw.replace('#', ''), 16);
@@ -200,12 +237,19 @@ async function handleSend(interaction) {
 
   const row = new ActionRowBuilder().addComponents(categorySelect);
 
-  await modalSubmit.reply({ embeds: [embed], components: [row] });
+  try {
+    await targetChannel.send({ embeds: [embed], components: [row] });
+  } catch (err) {
+    console.error('Failed to send ticket panel:', err);
+    return modalSubmit.editReply({ content: `Couldn't send the panel to ${targetChannel}.` });
+  }
+
+  await modalSubmit.editReply({ content: `Panel sent to ${targetChannel}.` });
 
   await logCommandActivity(interaction, {
     subcommand: 'send',
     success: true,
-    fields: { discordUser: interaction.user },
+    fields: { discordUser: interaction.user, channel: targetChannel },
   });
 }
 
@@ -227,6 +271,101 @@ async function handleSetTesti(interaction) {
   });
 
   return interaction.editReply({ content: `Testimonial channel set to ${channel}.` });
+}
+
+// ---------------------------------------------------------------------------
+// /ticket createcategory
+// ---------------------------------------------------------------------------
+async function handleCreateCategory(interaction) {
+  if (!requireAdmin(interaction)) return requireAdminReply(interaction);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const guild = interaction.guild;
+  const existing = await getTicketCategories(interaction.guildId);
+
+  // Re-running the command shouldn't duplicate categories -- reuse any that
+  // still exist, only create the missing ones.
+  const wanted = {
+    order: 'Order Tickets',
+    service: 'Service Tickets',
+    customerservice: 'Customer Service Tickets',
+  };
+
+  const result = { ...(existing || {}) };
+
+  for (const [key, name] of Object.entries(wanted)) {
+    const stillExists = result[key] && guild.channels.cache.has(result[key]);
+    if (stillExists) continue;
+
+    const created = await guild.channels.create({
+      name,
+      type: ChannelType.GuildCategory,
+    });
+    result[key] = created.id;
+  }
+
+  await setTicketCategories(interaction.guildId, result);
+
+  await logCommandActivity(interaction, {
+    subcommand: 'createcategory',
+    success: true,
+    fields: { discordUser: interaction.user },
+  });
+
+  return interaction.editReply({
+    content: `Ticket categories ready:\nOrder: <#${result.order}>\nService: <#${result.service}>\nCustomer Service: <#${result.customerservice}>`,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /ticket close
+// ---------------------------------------------------------------------------
+async function handleClose(interaction) {
+  if (!requireAdmin(interaction)) return requireAdminReply(interaction);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const targetChannel = interaction.options.getChannel('channel', true);
+
+  const ticket = await getTicket(targetChannel.id);
+  if (!ticket) {
+    return interaction.editReply({ content: `${targetChannel} is not a ticket channel.` });
+  }
+
+  // DM before delete -- once the channel's gone there's no fallback path to
+  // notify the creator, so this has to happen first even though it means a
+  // DM could succeed right before the delete fails (rare, and delete
+  // failing is loud/obvious to the admin either way).
+  const creator = await interaction.client.users.fetch(ticket.creatorId).catch(() => null);
+  let dmSent = false;
+  if (creator) {
+    try {
+      await creator.send(`Your ticket in **${interaction.guild.name}** has been closed.`);
+      dmSent = true;
+    } catch {
+      // DMs closed/blocked -- not fatal, ticket still closes.
+    }
+  }
+
+  await markTicketDeleted(targetChannel.id);
+
+  try {
+    await targetChannel.delete(`Ticket closed by ${interaction.user.tag}`);
+  } catch (err) {
+    console.error('Failed to delete ticket channel:', err);
+    return interaction.editReply({ content: `Couldn't delete ${targetChannel}. Check my permissions there.` });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'close',
+    success: true,
+    fields: { discordUser: interaction.user, ticketChannel: `<#${targetChannel.id}>` },
+  });
+
+  return interaction.editReply({
+    content: `Ticket closed and deleted.${dmSent ? '' : ' (Could not DM the creator — DMs may be closed.)'}`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -259,9 +398,17 @@ async function createTicketChannel(interaction, category, label) {
 
   const channelName = `${category}-${interaction.user.username}`.slice(0, 90);
 
+  const categories = await getTicketCategories(interaction.guildId);
+  const parentId = categories?.[category] || null;
+  // Verify the stored category channel still exists before using it as a
+  // parent -- an admin may have deleted it manually since /ticket
+  // createcategory ran, and passing a stale id throws on channel create.
+  const parentValid = parentId ? guild.channels.cache.has(parentId) : false;
+
   const channel = await guild.channels.create({
     name: channelName,
     type: ChannelType.GuildText,
+    parent: parentValid ? parentId : undefined,
     permissionOverwrites: overwrites,
     topic: `${label} ticket for ${interaction.user.tag}`,
   });
@@ -281,9 +428,14 @@ async function onPanelCategorySelect(interaction) {
   const category = interaction.values[0];
 
   if (category === 'order') {
+    // Ack immediately -- Firestore reads below (listProductTypes /
+    // listProductsByType loop) can push past the 3s interaction window,
+    // same cold-start trap as modals. deferReply first, editReply after.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
     const types = await listProductTypes(interaction.guildId);
     if (types.length === 0) {
-      return interaction.reply({ content: 'No products are available right now.', flags: MessageFlags.Ephemeral });
+      return interaction.editReply({ content: 'No products are available right now.' });
     }
 
     let allProducts = [];
@@ -293,7 +445,7 @@ async function onPanelCategorySelect(interaction) {
     }
 
     if (allProducts.length === 0) {
-      return interaction.reply({ content: 'No products are available right now.', flags: MessageFlags.Ephemeral });
+      return interaction.editReply({ content: 'No products are available right now.' });
     }
 
     const options = allProducts.slice(0, MAX_SELECT_OPTIONS).map((p) => ({
@@ -309,10 +461,9 @@ async function onPanelCategorySelect(interaction) {
       .setMaxValues(options.length)
       .addOptions(options);
 
-    return interaction.reply({
+    return interaction.editReply({
       content: 'Pick the product(s) you want to buy:',
       components: [new ActionRowBuilder().addComponents(select)],
-      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -410,18 +561,22 @@ async function loadProductsMap(productIds) {
 // Initial product multi-select submit -> build the qty-stepper cart, all
 // items starting at qty 1.
 async function onOrderProductSelect(interaction) {
+  // deferUpdate acks the select-menu click immediately -- loadProductsMap
+  // below is a Firestore loop and can push past the 3s window otherwise.
+  await interaction.deferUpdate();
+
   const productIds = interaction.values;
   const productsMap = await loadProductsMap(productIds);
 
   const cart = productIds.filter((id) => productsMap.has(id)).map((id) => ({ productId: id, qty: 1 }));
 
   if (cart.length === 0) {
-    return interaction.update({ content: 'Selected product(s) no longer exist. Try again.', components: [] });
+    return interaction.editReply({ content: 'Selected product(s) no longer exist. Try again.', components: [] });
   }
 
   const components = buildCartComponents(cart, productsMap);
 
-  return interaction.update({
+  return interaction.editReply({
     content: 'Adjust quantity with +/- then click **Create ticket**:',
     components,
   });
@@ -435,11 +590,14 @@ async function onOrderQtyButton(interaction) {
   const isDec = id.startsWith(`${CID.ORDER_QTY_BTN}_dec_`);
   if (!isInc && !isDec) return;
 
+  // Ack first -- same cold-start Firestore trap as onOrderProductSelect.
+  await interaction.deferUpdate();
+
   const productId = id.replace(`${CID.ORDER_QTY_BTN}_${isInc ? 'inc' : 'dec'}_`, '');
 
   const cart = buildCartFromMessage(interaction.message);
   const item = cart.find((c) => c.productId === productId);
-  if (!item) return interaction.deferUpdate();
+  if (!item) return;
 
   if (isInc) item.qty = Math.min(item.qty + 1, 99);
   if (isDec) item.qty = Math.max(item.qty - 1, 1);
@@ -447,7 +605,7 @@ async function onOrderQtyButton(interaction) {
   const productsMap = await loadProductsMap(cart.map((c) => c.productId));
   const components = buildCartComponents(cart, productsMap);
 
-  return interaction.update({ components });
+  return interaction.editReply({ components });
 }
 
 // "Create ticket" on the order cart -> creates the channel, sums total,
@@ -588,21 +746,17 @@ async function onCsCreateButton(interaction) {
 async function handleDone(interaction) {
   if (!requireAdmin(interaction)) return requireAdminReply(interaction);
 
-  const channelId = interaction.options.getString('ticketchannelid', true).trim();
-
-  if (interaction.channelId !== channelId) {
-    return interaction.reply({
-      content: 'You must run this command inside the ticket channel itself.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
+  const channelId = interaction.channelId;
 
   const ticket = await getTicket(channelId);
   if (!ticket) {
-    return interaction.reply({ content: 'No ticket record found for this channel.', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: 'This is not a ticket channel.', flags: MessageFlags.Ephemeral });
   }
   if (ticket.status === 'done') {
     return interaction.reply({ content: 'This ticket is already marked done.', flags: MessageFlags.Ephemeral });
+  }
+  if (ticket.status === 'deleted') {
+    return interaction.reply({ content: 'This ticket has already been closed.', flags: MessageFlags.Ephemeral });
   }
 
   const testiChannelId = await getTestiChannel(interaction.guildId);
