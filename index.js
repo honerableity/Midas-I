@@ -50,14 +50,45 @@ client.once('clientReady', () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  const command = client.commands.get(interaction.commandName);
-  if (!command) return;
+  if (interaction.isChatInputCommand()) {
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
+
+    try {
+      await command.execute(interaction);
+    } catch (err) {
+      console.error(`Error in /${interaction.commandName}:`, err);
+      try {
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp({ content: 'Bot error occurred.', flags: MessageFlags.Ephemeral });
+        } else {
+          await interaction.reply({ content: 'Bot error occurred.', flags: MessageFlags.Ephemeral });
+        }
+      } catch (replyErr) {
+        // Interaction likely expired (>3s) or was already acknowledged elsewhere.
+        // Nothing more we can do -- log and move on, don't let this crash the process.
+        console.error('Could not send error reply (interaction likely expired):', replyErr.message || replyErr);
+      }
+    }
+    return;
+  }
+
+  // Global router for persistent buttons/selects/modals that outlive the
+  // command interaction that created them (e.g. the /ticket send panel --
+  // still needs to work after a bot restart, unlike the in-command
+  // awaitMessageComponent collectors used elsewhere). Routed by customId
+  // prefix "ticket_" to commands/ticket.js's handleComponent().
+  const isComponent = interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit();
+  if (!isComponent) return;
+  if (!interaction.customId?.startsWith('ticket_')) return;
+
+  const ticketCommand = client.commands.get('ticket');
+  if (!ticketCommand?.handleComponent) return;
 
   try {
-    await command.execute(interaction);
+    await ticketCommand.handleComponent(interaction);
   } catch (err) {
-    console.error(`Error in /${interaction.commandName}:`, err);
+    console.error('Error in ticket component handler:', err);
     try {
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp({ content: 'Bot error occurred.', flags: MessageFlags.Ephemeral });
@@ -65,8 +96,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: 'Bot error occurred.', flags: MessageFlags.Ephemeral });
       }
     } catch (replyErr) {
-      // Interaction likely expired (>3s) or was already acknowledged elsewhere.
-      // Nothing more we can do -- log and move on, don't let this crash the process.
       console.error('Could not send error reply (interaction likely expired):', replyErr.message || replyErr);
     }
   }
