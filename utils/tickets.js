@@ -26,6 +26,21 @@ async function getTestiChannel(guildId) {
   return cfg.testiChannelId || null;
 }
 
+// Ticket category channels (created by /ticket createcategory) -- new ticket
+// channels get parented under the matching category so they don't clutter
+// the channel list root.
+async function setTicketCategories(guildId, categoryIds) {
+  await db.collection('guildConfig').doc(guildId).set(
+    { ticketCategories: categoryIds },
+    { merge: true }
+  );
+}
+
+async function getTicketCategories(guildId) {
+  const cfg = await getGuildConfig(guildId);
+  return cfg.ticketCategories || null;
+}
+
 // Atomic counter for testimonial numbering, per guild. Firestore transaction
 // so two /ticket done calls racing each other can't both grab the same number.
 async function nextTicketNumber(guildId) {
@@ -60,11 +75,25 @@ async function closeTicket(channelId, extra = {}) {
   );
 }
 
+// /ticket close deletes the actual Discord channel, so the ticket doc is
+// kept (not deleted) as a record -- just flagged. Firestore doc id (channel
+// id) staying put also means a re-run of /ticket close on an already-closed
+// channel id is harmless/idempotent.
+async function markTicketDeleted(channelId) {
+  await db.collection('tickets').doc(channelId).set(
+    { status: 'deleted', deletedAt: Date.now() },
+    { merge: true }
+  );
+}
+
 module.exports = {
   setTestiChannel,
   getTestiChannel,
+  setTicketCategories,
+  getTicketCategories,
   nextTicketNumber,
   createTicket,
   getTicket,
   closeTicket,
+  markTicketDeleted,
 };
