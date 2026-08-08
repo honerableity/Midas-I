@@ -62,24 +62,26 @@ async function createTicket(data) {
   });
 }
 
-// Double-click failsafe for the order flow's "Create ticket" button.
-// Discord can dispatch the same button click twice in rare cases (network
-// retry from the client, fast double-tap before the button visibly
-// disables) -- since each dispatch is a separate interaction, deferUpdate
-// alone can't stop both from running goToCreateTicketChannel(). Instead we
-// claim a short-lived per-user lock via Firestore transaction: whichever
-// call transacts first wins and proceeds, the second sees the lock already
-// held and is told to bail out (caller then deletes the channel it already
-// made as a failsafe cleanup). Lock auto-expires after LOCK_MS so a crashed
-// first attempt doesn't permanently block the user.
-const ORDER_LOCK_MS = 15 * 1000;
+// Double-click failsafe for ticket creation (order/service/customerservice
+// all use this). Discord can dispatch the same button/modal-submit as two
+// separate interactions in rare cases (client retry, fast double-tap before
+// the button visually disables) -- since each dispatch is a separate
+// interaction, deferUpdate alone can't stop both from running the
+// create-channel code. Instead we claim a short-lived per-user-per-category
+// lock via Firestore transaction: whichever call transacts first wins and
+// proceeds, the second sees the lock already held and is told to bail out
+// (caller then deletes the channel it already made as a failsafe cleanup).
+// Lock auto-expires after LOCK_MS so a crashed first attempt doesn't
+// permanently block the user. Keyed by category too, so creating an order
+// ticket doesn't block a concurrent service ticket for the same user.
+const CREATE_LOCK_MS = 15 * 1000;
 
-async function claimOrderCreateLock(userId) {
-  const ref = db.collection('orderLocks').doc(userId);
+async function claimTicketCreateLock(userId, category) {
+  const ref = db.collection('ticketCreateLocks').doc(`${userId}_${category}`);
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(ref);
     const now = Date.now();
-    if (doc.exists && (now - (doc.data().lockedAt || 0)) < ORDER_LOCK_MS) {
+    if (doc.exists && (now - (doc.data().lockedAt || 0)) < CREATE_LOCK_MS) {
       return false; // someone else (or an earlier click) holds the lock
     }
     tx.set(ref, { lockedAt: now });
@@ -87,8 +89,8 @@ async function claimOrderCreateLock(userId) {
   });
 }
 
-async function releaseOrderCreateLock(userId) {
-  await db.collection('orderLocks').doc(userId).delete().catch(() => {});
+async function releaseTicketCreateLock(userId, category) {
+  await db.collection('ticketCreateLocks').doc(`${userId}_${category}`).delete().catch(() => {});
 }
 
 // Discord customIds cap at 100 chars, and product ids are uuidv4 (36 chars
@@ -121,6 +123,28 @@ async function getTicket(channelId) {
   return { id: doc.id, ...doc.data() };
 }
 
+// One open ticket per category per user (order/service/customerservice
+// checked separately -- a user can have one open order ticket AND one open
+// service ticket at the same time, just not two open order tickets).
+// Filtering category in JS instead of adding it to the Firestore query
+// keeps this to a 2-field equality query (creatorId + status), which
+// doesn't need a composite index; a 3-field guildId+creatorId+status query
+// would.
+async function findOpenTicket(guildId, creatorId, category) {
+  const snap = await db.collection('tickets')
+    .where('creatorId', '==', creatorId)
+    .where('status', '==', 'open')
+    .get();
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    if (data.guildId === guildId && data.category === category) {
+      return { id: doc.id, ...data };
+    }
+  }
+  return null;
+}
+
 async function closeTicket(channelId, extra = {}) {
   await db.collection('tickets').doc(channelId).set(
     { status: 'done', closedAt: Date.now(), ...extra },
@@ -147,10 +171,11 @@ module.exports = {
   nextTicketNumber,
   createTicket,
   getTicket,
+  findOpenTicket,
   closeTicket,
   markTicketDeleted,
-  claimOrderCreateLock,
-  releaseOrderCreateLock,
+  claimTicketCreateLock,
+  releaseTicketCreateLock,
   saveOrderSelection,
   getOrderSelection,
 };
