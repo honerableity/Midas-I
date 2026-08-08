@@ -9,6 +9,8 @@ const { logCommandActivity } = require('../utils/logger.js');
 const {
   parseDuration,
   formatDuration,
+  isProtectedTarget,
+  sendModDM,
   getWarnThresholds,
   addWarnThreshold,
   addWarn,
@@ -82,6 +84,22 @@ module.exports = {
 
     .addSubcommand((sub) =>
       sub
+        .setName('unmute')
+        .setDescription('Remove an active timeout from a user')
+        .addUserOption((opt) => opt.setName('user').setDescription('User to unmute').setRequired(true))
+        .addStringOption((opt) => opt.setName('reason').setDescription('Reason').setRequired(false))
+    )
+
+    .addSubcommand((sub) =>
+      sub
+        .setName('unvcmute')
+        .setDescription('Remove voice server-mute from a user')
+        .addUserOption((opt) => opt.setName('user').setDescription('User to unmute').setRequired(true))
+        .addStringOption((opt) => opt.setName('reason').setDescription('Reason').setRequired(false))
+    )
+
+    .addSubcommand((sub) =>
+      sub
         .setName('warn')
         .setDescription('Warn a user (DMs them)')
         .addUserOption((opt) => opt.setName('user').setDescription('User to warn').setRequired(true))
@@ -124,6 +142,8 @@ module.exports = {
       unban: { label: 'Mod — Unban', fields: ['discordUser'] },
       mute: { label: 'Mod — Mute', fields: ['discordUser', 'duration', 'reason'] },
       vcmute: { label: 'Mod — VC Mute', fields: ['discordUser', 'duration', 'reason'] },
+      unmute: { label: 'Mod — Unmute', fields: ['discordUser', 'reason'] },
+      unvcmute: { label: 'Mod — VC Unmute', fields: ['discordUser', 'reason'] },
       warn: { label: 'Mod — Warn', fields: ['discordUser', 'reason', 'warnCount'] },
       setwarn: { label: 'Mod — Set Warn Rule', fields: ['warnCount', 'action', 'duration', 'role'] },
       honeypot: { label: 'Mod — Honeypot Set', fields: ['channel'] },
@@ -159,6 +179,10 @@ module.exports = {
           return await handleMute(interaction);
         case 'vcmute':
           return await handleVcMute(interaction);
+        case 'unmute':
+          return await handleUnmute(interaction);
+        case 'unvcmute':
+          return await handleUnvcMute(interaction);
         case 'warn':
           return await handleWarn(interaction);
         case 'setwarn':
@@ -191,9 +215,23 @@ async function handleBan(interaction) {
   }
 
   const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return interaction.editReply({ content: `Can't ban ${user.tag} — protected (${guard.reason}).` });
+  }
+
   if (member && !member.bannable) {
     return interaction.editReply({ content: `I can't ban ${user.tag} — check role hierarchy / my permissions.` });
   }
+
+  // DM before the ban -- once banned, shared guilds may drop and DMs can fail.
+  await sendModDM(user, {
+    guildName: interaction.guild.name,
+    action: 'Banned',
+    reason,
+    duration: durationMs === null ? 'permanent' : formatDuration(durationMs),
+  });
 
   await interaction.guild.bans.create(user.id, { reason: `${reason} (by ${interaction.user.tag})` });
 
@@ -221,9 +259,18 @@ async function handleKick(interaction) {
   if (!member) {
     return interaction.editReply({ content: `${user.tag} is not in this server.` });
   }
+
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return interaction.editReply({ content: `Can't kick ${user.tag} — protected (${guard.reason}).` });
+  }
+
   if (!member.kickable) {
     return interaction.editReply({ content: `I can't kick ${user.tag} — check role hierarchy / my permissions.` });
   }
+
+  // DM before the kick -- once kicked, DMs can fail if no shared guilds remain.
+  await sendModDM(user, { guildName: interaction.guild.name, action: 'Kicked', reason });
 
   await member.kick(`${reason} (by ${interaction.user.tag})`);
 
@@ -246,6 +293,10 @@ async function handleUnban(interaction) {
 
   await interaction.guild.bans.remove(userId, `Unbanned by ${interaction.user.tag}`);
   await clearExpiringActions(interaction.guildId, userId, 'ban');
+
+  // Best effort -- user isn't in the guild so this only lands if they share
+  // another mutual server/DM channel with the bot.
+  await sendModDM(banEntry.user, { guildName: interaction.guild.name, action: 'Unbanned', reversal: true });
 
   await interaction.editReply({ content: `Unbanned ${banEntry.user.tag}.` });
 
@@ -275,11 +326,19 @@ async function handleMute(interaction) {
   if (!member) {
     return interaction.editReply({ content: `${user.tag} is not in this server.` });
   }
+
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return interaction.editReply({ content: `Can't mute ${user.tag} — protected (${guard.reason}).` });
+  }
+
   if (!member.moderatable) {
     return interaction.editReply({ content: `I can't timeout ${user.tag} — check role hierarchy / my permissions.` });
   }
 
   await member.timeout(durationMs, `${reason} (by ${interaction.user.tag})`);
+
+  await sendModDM(user, { guildName: interaction.guild.name, action: 'Muted', reason, duration: formatDuration(durationMs) });
 
   await interaction.editReply({ content: `Muted ${user.tag} for ${formatDuration(durationMs)}. Reason: ${reason}` });
 
@@ -307,6 +366,12 @@ async function handleVcMute(interaction) {
   if (!member.voice?.channelId) {
     return interaction.editReply({ content: `${user.tag} is not currently in a voice channel.` });
   }
+
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return interaction.editReply({ content: `Can't voice-mute ${user.tag} — protected (${guard.reason}).` });
+  }
+
   if (!member.moderatable) {
     return interaction.editReply({ content: `I can't voice-mute ${user.tag} — check role hierarchy / my permissions.` });
   }
@@ -317,6 +382,13 @@ async function handleVcMute(interaction) {
   if (durationMs !== null) {
     await scheduleExpiringAction(interaction.guildId, user.id, 'vcmute', Date.now() + durationMs, interaction.user.id);
   }
+
+  await sendModDM(user, {
+    guildName: interaction.guild.name,
+    action: 'Voice-muted',
+    reason,
+    duration: durationMs === null ? 'indefinite' : formatDuration(durationMs),
+  });
 
   await interaction.editReply({
     content: `Voice-muted ${user.tag} — ${durationMs === null ? 'indefinite' : formatDuration(durationMs)}. Reason: ${reason}`,
@@ -329,9 +401,72 @@ async function handleVcMute(interaction) {
   });
 }
 
+async function handleUnmute(interaction) {
+  const user = interaction.options.getUser('user', true);
+  const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  if (!member) {
+    return interaction.editReply({ content: `${user.tag} is not in this server.` });
+  }
+  if (!member.communicationDisabledUntil || member.communicationDisabledUntil < new Date()) {
+    return interaction.editReply({ content: `${user.tag} is not currently muted.` });
+  }
+  if (!member.moderatable) {
+    return interaction.editReply({ content: `I can't unmute ${user.tag} — check role hierarchy / my permissions.` });
+  }
+
+  await member.timeout(null, `${reason} (by ${interaction.user.tag})`);
+
+  await sendModDM(user, { guildName: interaction.guild.name, action: 'Unmuted', reason, reversal: true });
+
+  await interaction.editReply({ content: `Unmuted ${user.tag}. Reason: ${reason}` });
+
+  await logCommandActivity(interaction, {
+    subcommand: 'unmute',
+    success: true,
+    fields: { discordUser: user, reason },
+  });
+}
+
+async function handleUnvcMute(interaction) {
+  const user = interaction.options.getUser('user', true);
+  const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  if (!member) {
+    return interaction.editReply({ content: `${user.tag} is not in this server.` });
+  }
+  if (!member.voice?.serverMute) {
+    return interaction.editReply({ content: `${user.tag} is not currently voice-muted.` });
+  }
+  if (!member.moderatable) {
+    return interaction.editReply({ content: `I can't unmute ${user.tag} — check role hierarchy / my permissions.` });
+  }
+
+  await member.voice.setMute(false, `${reason} (by ${interaction.user.tag})`);
+  await clearExpiringActions(interaction.guildId, user.id, 'vcmute');
+
+  await sendModDM(user, { guildName: interaction.guild.name, action: 'Voice-unmuted', reason, reversal: true });
+
+  await interaction.editReply({ content: `Voice-unmuted ${user.tag}. Reason: ${reason}` });
+
+  await logCommandActivity(interaction, {
+    subcommand: 'unvcmute',
+    success: true,
+    fields: { discordUser: user, reason },
+  });
+}
+
 async function handleWarn(interaction) {
   const user = interaction.options.getUser('user', true);
   const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return interaction.editReply({ content: `Can't warn ${user.tag} — protected (${guard.reason}).` });
+  }
 
   const data = await addWarn(interaction.guildId, user.id, interaction.user.id, reason);
   const count = data.count;
@@ -369,8 +504,21 @@ async function handleWarn(interaction) {
 async function applyThresholdAction(interaction, user, threshold) {
   const member = await interaction.guild.members.fetch(user.id).catch(() => null);
 
+  // Threshold actions fire automatically off warn counts -- still must not
+  // touch protected targets (owner / bots / Manage Server holders).
+  const guard = isProtectedTarget(interaction.guild, member, user);
+  if (guard.blocked) {
+    return `Reached ${threshold.count} warns but target is protected (${guard.reason}) — auto-action skipped.`;
+  }
+
   if (threshold.action === 'ban') {
     if (member && !member.bannable) return `Reached ${threshold.count} warns but I can't ban (permissions).`;
+    await sendModDM(user, {
+      guildName: interaction.guild.name,
+      action: 'Banned',
+      reason: `Reached ${threshold.count} warns`,
+      duration: 'permanent',
+    });
     await interaction.guild.bans.create(user.id, { reason: `Auto-ban at ${threshold.count} warns` });
     return `Auto-banned for reaching ${threshold.count} warns.`;
   }
@@ -378,6 +526,7 @@ async function applyThresholdAction(interaction, user, threshold) {
   if (threshold.action === 'kick') {
     if (!member) return `Reached ${threshold.count} warns but user already left.`;
     if (!member.kickable) return `Reached ${threshold.count} warns but I can't kick (permissions).`;
+    await sendModDM(user, { guildName: interaction.guild.name, action: 'Kicked', reason: `Reached ${threshold.count} warns` });
     await member.kick(`Auto-kick at ${threshold.count} warns`);
     return `Auto-kicked for reaching ${threshold.count} warns.`;
   }
@@ -387,6 +536,12 @@ async function applyThresholdAction(interaction, user, threshold) {
     if (!member.moderatable) return `Reached ${threshold.count} warns but I can't mute (permissions).`;
     const durationMs = parseDuration(threshold.duration) || 10 * 60 * 1000; // fallback 10m
     await member.timeout(durationMs, `Auto-mute at ${threshold.count} warns`);
+    await sendModDM(user, {
+      guildName: interaction.guild.name,
+      action: 'Muted',
+      reason: `Reached ${threshold.count} warns`,
+      duration: formatDuration(durationMs),
+    });
     return `Auto-muted for ${formatDuration(durationMs)} for reaching ${threshold.count} warns.`;
   }
 
@@ -466,6 +621,16 @@ async function handleHoneypotMessage(message) {
   const guild = message.guild;
   const userId = message.author.id;
 
+  // Protected-target guard runs FIRST, before any deletion/purge/ban -- an
+  // owner, bot, or Manage Server holder tripping the honeypot must be a total
+  // no-op (message stays, nothing purged, no ban).
+  const member = await guild.members.fetch(userId).catch(() => null);
+  const guard = isProtectedTarget(guild, member, message.author);
+  if (guard.blocked) {
+    console.error(`[mod] honeypot triggered by ${message.author.tag} but target is protected (${guard.reason}) — ignoring entirely.`);
+    return;
+  }
+
   // Delete the triggering message first, best effort.
   await message.delete().catch(() => {});
 
@@ -490,11 +655,17 @@ async function handleHoneypotMessage(message) {
     }
   }
 
-  const member = await guild.members.fetch(userId).catch(() => null);
   if (member && !member.bannable) {
     console.error(`[mod] honeypot triggered by ${message.author.tag} but member is not bannable.`);
     return;
   }
+
+  await sendModDM(message.author, {
+    guildName: guild.name,
+    action: 'Banned',
+    reason: 'Honeypot channel triggered',
+    duration: formatDuration(7 * 24 * 60 * 60 * 1000),
+  });
 
   await guild.bans.create(userId, { reason: 'Honeypot channel triggered', deleteMessageSeconds: 7 * 24 * 60 * 60 });
 
