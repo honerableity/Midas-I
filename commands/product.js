@@ -42,6 +42,13 @@ function requireAdmin(interaction) {
   return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
 }
 
+// Price is free-typed text ("25000", "Rp25.000", "0", "Free", ...). Treat as
+// free when the whole trimmed value is exactly "0" or "free" (any casing).
+function isFreeProduct(price) {
+  const normalized = String(price ?? '').trim().toLowerCase();
+  return normalized === '0' || normalized === 'free';
+}
+
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('product')
@@ -879,15 +886,23 @@ async function handleSendPost(interaction) {
     return interaction.editReply({ content: 'Forum untuk jenis produk ini sudah tidak ada. Jalankan `/product createtype` lagi untuk membuatnya ulang.' });
   }
 
+  const isFree = isFreeProduct(product.price);
+
   const embed = new EmbedBuilder()
     .setTitle(product.name)
     .setColor(0x00b0f4)
     .addFields(
-      { name: 'Harga', value: product.price, inline: true },
+      { name: 'Harga', value: isFree ? 'GRATIS' : product.price, inline: true },
       { name: 'Jenis', value: product.type, inline: true },
       { name: 'Kreator', value: product.creator, inline: true },
-      { name: 'Link File', value: product.fileLink },
     );
+
+  // Free products get a direct-download button instead of a raw link field
+  // (button only added at post-time below, since embeds can't hold buttons).
+  // Paid products still show the link field like before.
+  if (!isFree) {
+    embed.addFields({ name: 'Link File', value: product.fileLink });
+  }
 
   // Attach review media as an actual embed image when it looks like a direct
   // image URL; otherwise (video links, non-direct hosts) fall back to a
@@ -897,6 +912,23 @@ async function handleSendPost(interaction) {
     embed.setImage(product.reviewMedia);
   } else {
     embed.addFields({ name: 'Video/Gambar Review', value: product.reviewMedia });
+  }
+
+  // Free products get a "Download" link button under the post. Link buttons
+  // require a valid http(s) URL -- bad/non-URL fileLink falls back to
+  // showing the link as a plain field instead of crashing the post.
+  let downloadRow = null;
+  if (isFree) {
+    try {
+      const downloadButton = new ButtonBuilder()
+        .setLabel('Download')
+        .setStyle(ButtonStyle.Link)
+        .setURL(product.fileLink);
+      downloadRow = new ActionRowBuilder().addComponents(downloadButton);
+    } catch (err) {
+      // fileLink isn't a valid URL for a Link button -- show as text instead.
+      embed.addFields({ name: 'Link File', value: product.fileLink });
+    }
   }
 
   // If this product already has a live thread (previous sendpost, possibly
@@ -923,7 +955,11 @@ async function handleSendPost(interaction) {
         // fall back to a fresh thread instead of leaving an empty post.
         throw new Error('Starter message missing, cannot edit in place.');
       }
-      await starterMessage.edit({ content: product.description, embeds: [embed] });
+      await starterMessage.edit({
+        content: product.description,
+        embeds: [embed],
+        components: downloadRow ? [downloadRow] : [],
+      });
       thread = existingThread;
       wasUpdate = true;
     } catch (err) {
@@ -939,6 +975,7 @@ async function handleSendPost(interaction) {
         message: {
           content: product.description,
           embeds: [embed],
+          components: downloadRow ? [downloadRow] : [],
         },
       });
     } catch (err) {
