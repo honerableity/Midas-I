@@ -14,7 +14,7 @@ const {
 } = require('discord.js');
 const { v4: uuidv4 } = require('uuid');
 const { logCommandActivity } = require('../utils/logger.js');
-const { listProductTypes, listProductsByType, getProduct, giveProductToUser } = require('../utils/products.js');
+const { listProductTypes, listProductsByType, getProduct, giveProductToUser, buildProductDeliveryDM } = require('../utils/products.js');
 const { getVerifiedUser } = require('../utils/verification.js');
 const {
   setTestiChannel,
@@ -877,7 +877,7 @@ async function handleDone(interaction) {
       if (!creator || !product?.fileLink) continue;
 
       try {
-        await creator.send(`Here's your file for **${product.name}**: ${product.fileLink}`);
+        await creator.send(buildProductDeliveryDM(product));
       } catch {
         // DMs closed/blocked -- ownership is still granted, just flag it so
         // the admin knows to deliver the link another way.

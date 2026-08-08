@@ -25,6 +25,7 @@ const {
   userOwnsProduct,
   giveProductToUser,
   revokeProductFromUser,
+  buildProductDeliveryDM,
 } = require('../utils/products.js');
 const { getVerifiedUser } = require('../utils/verification.js');
 
@@ -297,9 +298,17 @@ async function handleCreate(interaction) {
     .setStyle(TextInputStyle.Short)
     .setRequired(true);
 
+  const tutorialLinkInput = new TextInputBuilder()
+    .setCustomId('product_tutorial_link')
+    .setLabel('Link Tutorial (opsional)')
+    .setPlaceholder('Link tutorial cara pakai produk, boleh kosong')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false);
+
   modal2.addComponents(
     new ActionRowBuilder().addComponents(fileLinkInput),
     new ActionRowBuilder().addComponents(reviewMediaInput),
+    new ActionRowBuilder().addComponents(tutorialLinkInput),
   );
 
   await btnInteraction.showModal(modal2);
@@ -319,6 +328,7 @@ async function handleCreate(interaction) {
 
   const productFileLink = modal2Submit.fields.getTextInputValue('product_file_link').trim();
   const productReviewMedia = modal2Submit.fields.getTextInputValue('product_review_media').trim();
+  const productTutorialLink = modal2Submit.fields.getTextInputValue('product_tutorial_link').trim();
 
   // Both text-input steps are done. deferReply() then editReply() so we can
   // now show the type select menu (select menus can't live inside a modal).
@@ -383,6 +393,7 @@ async function handleCreate(interaction) {
     description: productDescription,
     price: productPrice,
     fileLink: productFileLink,
+    tutorialLink: productTutorialLink,
     reviewMedia: productReviewMedia,
     creator: productCreator,
     type: selectedType.name,
@@ -571,9 +582,18 @@ async function handleEdit(interaction) {
     .setValue(product.reviewMedia || '')
     .setRequired(true);
 
+  const tutorialLinkInput = new TextInputBuilder()
+    .setCustomId('product_tutorial_link')
+    .setLabel('Link Tutorial (opsional)')
+    .setPlaceholder('Link tutorial cara pakai produk, boleh kosong')
+    .setStyle(TextInputStyle.Short)
+    .setValue(product.tutorialLink || '')
+    .setRequired(false);
+
   modal2.addComponents(
     new ActionRowBuilder().addComponents(fileLinkInput),
     new ActionRowBuilder().addComponents(reviewMediaInput),
+    new ActionRowBuilder().addComponents(tutorialLinkInput),
   );
 
   await btnInteraction.showModal(modal2);
@@ -593,6 +613,7 @@ async function handleEdit(interaction) {
 
   const productFileLink = modal2Submit.fields.getTextInputValue('product_file_link').trim();
   const productReviewMedia = modal2Submit.fields.getTextInputValue('product_review_media').trim();
+  const productTutorialLink = modal2Submit.fields.getTextInputValue('product_tutorial_link').trim();
 
   await modal2Submit.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -683,6 +704,7 @@ async function handleEdit(interaction) {
     description: productDescription,
     price: productPrice,
     fileLink: productFileLink,
+    tutorialLink: productTutorialLink,
     reviewMedia: productReviewMedia,
     creator: productCreator,
     type: selectedType.name,
@@ -1440,9 +1462,7 @@ async function handleGet(interaction) {
   }
 
   try {
-    await interaction.user.send({
-      content: `**${product.name}**\nLink file: ${product.fileLink}`,
-    });
+    await interaction.user.send(buildProductDeliveryDM(product));
   } catch (err) {
     await logCommandActivity(interaction, {
       subcommand: 'get',
