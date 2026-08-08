@@ -953,6 +953,12 @@ async function handleSendPost(interaction) {
     }
   }
 
+  // Free products show the tutorial link as plain text under the post
+  // content (not in the embed) -- only when a tutorial link was set.
+  const postContent = (isFree && product.tutorialLink)
+    ? `${product.description}\n\nTutorial: ${product.tutorialLink}`
+    : product.description;
+
   // If this product already has a live thread (previous sendpost, possibly
   // followed by /product edit), update that thread in place instead of
   // spawning a duplicate -- this is what makes sendpost double as the "push
@@ -978,7 +984,7 @@ async function handleSendPost(interaction) {
         throw new Error('Starter message missing, cannot edit in place.');
       }
       await starterMessage.edit({
-        content: product.description,
+        content: postContent,
         embeds: [embed],
         components: downloadRow ? [downloadRow] : [],
       });
@@ -995,7 +1001,7 @@ async function handleSendPost(interaction) {
       thread = await forumChannel.threads.create({
         name: product.name,
         message: {
-          content: product.description,
+          content: postContent,
           embeds: [embed],
           components: downloadRow ? [downloadRow] : [],
         },
