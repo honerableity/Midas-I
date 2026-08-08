@@ -82,36 +82,41 @@ async function getProductTypeById(typeId) {
 // Idempotent by design -- calling this again for the same type name reuses
 // the existing forum channel and re-applies the permission overwrites
 // instead of creating a duplicate.
+function buildForumPermissionOverwrites(guild) {
+  return [
+    {
+      id: guild.roles.everyone.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
+      ],
+    },
+    {
+      id: guild.client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.ManageChannels,
+      ],
+    },
+  ];
+}
+
 async function createOrSyncProductTypeForum(guild, guildId, typeName) {
   const existingType = await getProductTypeByName(guildId, typeName);
 
   const category = await resolveProductCategory(guild, guildId);
-
-  const everyoneOverwrite = {
-    id: guild.roles.everyone.id,
-    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-    deny: [
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.SendMessagesInThreads,
-      PermissionFlagsBits.CreatePublicThreads,
-      PermissionFlagsBits.CreatePrivateThreads,
-    ],
-  };
-  const botOverwrite = {
-    id: guild.client.user.id,
-    allow: [
-      PermissionFlagsBits.ViewChannel,
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.SendMessagesInThreads,
-      PermissionFlagsBits.CreatePublicThreads,
-      PermissionFlagsBits.ManageChannels,
-    ],
-  };
+  const overwrites = buildForumPermissionOverwrites(guild);
 
   if (existingType?.forumChannelId) {
     const existingChannel = await guild.channels.fetch(existingType.forumChannelId).catch(() => null);
     if (existingChannel) {
-      await existingChannel.permissionOverwrites.set([everyoneOverwrite, botOverwrite]);
+      await existingChannel.permissionOverwrites.set(overwrites);
       return { type: existingType, forumChannel: existingChannel, created: false };
     }
     // Stored channel id is stale (deleted manually) -- fall through and create a fresh one below.
@@ -122,7 +127,7 @@ async function createOrSyncProductTypeForum(guild, guildId, typeName) {
     type: ChannelType.GuildForum,
     parent: category.id,
     topic: `Produk kategori: ${typeName}`,
-    permissionOverwrites: [everyoneOverwrite, botOverwrite],
+    permissionOverwrites: overwrites,
   });
 
   let typeDoc;
@@ -143,6 +148,40 @@ async function createOrSyncProductTypeForum(guild, guildId, typeName) {
   }
 
   return { type: typeDoc, forumChannel, created: true };
+}
+
+// Links a product type to an ALREADY-EXISTING forum channel instead of
+// creating a new one -- for admins who already made the channel by hand (or
+// want to reuse one from a restructure) and just want the bot to register it
+// as a jenis. Caller (handleLinkType) validates the channel is a GuildForum
+// before calling this; this function just re-applies the same admin-post /
+// member-view permission overwrites createOrSyncProductTypeForum uses, so a
+// linked channel behaves identically to a bot-created one from then on
+// (e.g. /product sendpost works the same either way).
+async function linkExistingForumToType(guild, guildId, typeName, forumChannel) {
+  const existingType = await getProductTypeByName(guildId, typeName);
+  const overwrites = buildForumPermissionOverwrites(guild);
+
+  await forumChannel.permissionOverwrites.set(overwrites);
+
+  let typeDoc;
+  if (existingType) {
+    await db.collection('productTypes').doc(existingType.id).set(
+      { forumChannelId: forumChannel.id },
+      { merge: true }
+    );
+    typeDoc = { ...existingType, forumChannelId: forumChannel.id };
+  } else {
+    const ref = await db.collection('productTypes').add({
+      name: typeName,
+      guildId,
+      forumChannelId: forumChannel.id,
+      createdAt: Date.now(),
+    });
+    typeDoc = { id: ref.id, name: typeName, guildId, forumChannelId: forumChannel.id };
+  }
+
+  return { type: typeDoc, forumChannel, wasExistingType: !!existingType };
 }
 
 async function getProduct(productId) {
@@ -233,6 +272,7 @@ module.exports = {
   getProductTypeByName,
   getProductTypeById,
   createOrSyncProductTypeForum,
+  linkExistingForumToType,
   getProduct,
   listProductsByType,
   saveProduct,
