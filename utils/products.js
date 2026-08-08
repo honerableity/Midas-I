@@ -1,4 +1,4 @@
-const { ChannelType, PermissionFlagsBits } = require('discord.js');
+const { ChannelType, PermissionFlagsBits, EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder } = require('discord.js');
 const { FieldValue } = require('firebase-admin/firestore');
 const { db } = require('./firebase.js');
 
@@ -265,6 +265,50 @@ async function getProductsByIds(productIds) {
     .map((d) => ({ id: d.id, ...d.data() }));
 }
 
+// Builds the DM payload used to deliver a purchased/owned product to a user
+// -- shared by /product get and /ticket done so both send the exact same
+// embed+button format. tutorialLink is optional; when blank the tutorial
+// line is skipped entirely rather than shown as "N/A".
+//
+// The Download button is a Link-style button, which requires a valid
+// http(s) URL. If fileLink isn't one (bad data, non-URL string), Discord
+// would throw on .setURL() -- fall back to a plain text field showing the
+// link instead of letting the whole send blow up.
+function buildProductDeliveryDM(product) {
+  const embed = new EmbedBuilder()
+    .setTitle(product.name)
+    .setColor(0x00b0f4)
+    .setDescription('Here is your product, click the button below to download the file.');
+
+  const components = [];
+  const row = new ActionRowBuilder();
+  let buttonOk = true;
+
+  try {
+    row.addComponents(
+      new ButtonBuilder()
+        .setLabel('Download')
+        .setStyle(ButtonStyle.Link)
+        .setURL(product.fileLink)
+    );
+  } catch {
+    buttonOk = false;
+  }
+
+  if (product.tutorialLink) {
+    embed.addFields({ name: 'Tutorial', value: product.tutorialLink });
+  }
+
+  if (buttonOk) {
+    components.push(row);
+  } else {
+    // fileLink wasn't a valid URL for a Link button -- show it as text.
+    embed.addFields({ name: 'Link File', value: product.fileLink });
+  }
+
+  return { embeds: [embed], components };
+}
+
 module.exports = {
   slugifyChannelName,
   resolveProductCategory,
@@ -281,4 +325,5 @@ module.exports = {
   giveProductToUser,
   revokeProductFromUser,
   getProductsByIds,
+  buildProductDeliveryDM,
 };
