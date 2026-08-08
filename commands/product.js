@@ -17,6 +17,7 @@ const { logCommandActivity } = require('../utils/logger.js');
 const {
   listProductTypes,
   createOrSyncProductTypeForum,
+  linkExistingForumToType,
   getProduct,
   listProductsByType,
   saveProduct,
@@ -56,6 +57,17 @@ module.exports = {
         .setDescription('Create (or re-sync) a product type and its dedicated forum channel')
         .addStringOption(opt =>
           opt.setName('nama').setDescription('Nama jenis produk').setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('linktype')
+        .setDescription('Link a product type to an already-existing forum channel')
+        .addStringOption(opt =>
+          opt.setName('nama').setDescription('Nama jenis produk').setRequired(true)
+        )
+        .addChannelOption(opt =>
+          opt.setName('channel').setDescription('Existing forum channel to link').setRequired(true).addChannelTypes(ChannelType.GuildForum)
         )
     )
     .addSubcommand(sub =>
@@ -123,6 +135,7 @@ module.exports = {
     subcommands: {
       create: { label: 'Product — Created', fields: ['discordUser', 'productId', 'productName'] },
       createtype: { label: 'Product — Type Created', fields: ['discordUser', 'typeName', 'forumChannel'] },
+      linktype: { label: 'Product — Type Linked', fields: ['discordUser', 'typeName', 'forumChannel'] },
       sendpost: { label: 'Product — Post Sent', fields: ['discordUser', 'productId', 'forumChannel'] },
       edit: { label: 'Product — Edited', fields: ['discordUser', 'productId', 'productName'] },
       view: { label: 'Product — Browsed', fields: ['discordUser'] },
@@ -142,6 +155,7 @@ module.exports = {
 
     if (sub === 'create') return handleCreate(interaction);
     if (sub === 'createtype') return handleCreateType(interaction);
+    if (sub === 'linktype') return handleLinkType(interaction);
     if (sub === 'sendpost') return handleSendPost(interaction);
     if (sub === 'edit') return handleEdit(interaction);
     if (sub === 'view') return handleView(interaction);
@@ -754,6 +768,65 @@ async function handleCreateType(interaction) {
   return interaction.editReply({
     content: `Jenis produk **${typeName}** ${verb}. Forum: ${result.forumChannel}`,
   });
+}
+
+// ---------------------------------------------------------------------------
+// /product linktype -- registers an EXISTING forum channel as a jenis,
+// instead of createtype's always-make-a-new-channel behavior. Same
+// permission overwrites get applied so the linked channel works identically
+// with /product sendpost afterward.
+// ---------------------------------------------------------------------------
+async function handleLinkType(interaction) {
+  if (!requireAdmin(interaction)) {
+    return interaction.reply({
+      content: 'You need **Administrator** permission to do that.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  // Defer immediately -- Firestore reads + permission overwrite calls follow,
+  // same cold-start guard used throughout the rest of the bot.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const typeName = interaction.options.getString('nama', true).trim();
+  if (!typeName) {
+    return interaction.editReply({ content: 'Nama jenis tidak boleh kosong.' });
+  }
+
+  const channel = interaction.options.getChannel('channel', true);
+
+  // addChannelTypes(GuildForum) on the option already restricts Discord's
+  // own channel picker to forum channels, but that's a client-side filter
+  // only -- still verify server-side in case of a stale/cached option value.
+  if (channel.type !== ChannelType.GuildForum) {
+    return interaction.editReply({ content: `${channel} bukan forum channel. Pilih forum channel yang sudah ada.` });
+  }
+
+  let result;
+  try {
+    result = await linkExistingForumToType(interaction.guild, interaction.guildId, typeName, channel);
+  } catch (err) {
+    console.error('linkExistingForumToType failed:', err);
+    await logCommandActivity(interaction, {
+      subcommand: 'linktype',
+      success: false,
+      fields: { discordUser: interaction.user, typeName },
+      note: 'Linking existing forum channel failed.',
+    });
+    return interaction.editReply({ content: 'Bot error saat menghubungkan jenis produk ke channel. Cek permission Manage Channels bot di channel tersebut.' });
+  }
+
+  await logCommandActivity(interaction, {
+    subcommand: 'linktype',
+    success: true,
+    fields: { discordUser: interaction.user, typeName, forumChannel: result.forumChannel },
+  });
+
+  const note = result.wasExistingType
+    ? `Jenis produk **${typeName}** sekarang terhubung ke ${result.forumChannel}. Forum lama (kalau berbeda) tidak dihapus.`
+    : `Jenis produk **${typeName}** dibuat dan dihubungkan ke ${result.forumChannel}.`;
+
+  return interaction.editReply({ content: note });
 }
 
 // ---------------------------------------------------------------------------
