@@ -26,6 +26,7 @@ const {
   giveProductToUser,
   revokeProductFromUser,
   buildProductDeliveryDM,
+  getProductsByIds,
 } = require('../utils/products.js');
 const { getVerifiedUser } = require('../utils/verification.js');
 
@@ -134,7 +135,7 @@ module.exports = {
         .setName('get')
         .setDescription('Get the file link of a product you own, sent to your DM')
         .addStringOption(opt =>
-          opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true)
+          opt.setName('product_uuid').setDescription('ID produk (UUID)').setRequired(true).setAutocomplete(true)
         )
     ),
 
@@ -171,6 +172,15 @@ module.exports = {
     if (sub === 'give') return handleGive(interaction);
     if (sub === 'revoke') return handleRevoke(interaction);
     if (sub === 'get') return handleGet(interaction);
+  },
+
+  // Routed from index.js's global autocomplete router. Only "get" has an
+  // autocomplete option right now -- guard on subcommand in case more get
+  // added later with different-meaning string opts.
+  async autocomplete(interaction) {
+    const sub = interaction.options.getSubcommand(true);
+    if (sub === 'get') return autocompleteGetProductUuid(interaction);
+    return interaction.respond([]);
   },
 };
 
@@ -1430,6 +1440,29 @@ async function handleRevoke(interaction) {
 // ---------------------------------------------------------------------------
 // /product get
 // ---------------------------------------------------------------------------
+// Autocomplete for /product get's product_uuid -- lists only the products
+// the requesting user actually owns, so they don't have to know/paste a
+// UUID. Unverified users or users with no owned products just get an empty
+// list (not an error -- autocomplete has no room to show error text).
+async function autocompleteGetProductUuid(interaction) {
+  const focused = interaction.options.getFocused().toLowerCase();
+
+  const verifiedRecord = await getVerifiedUser(interaction.user.id);
+  const ownedIds = verifiedRecord?.ownedProducts;
+  if (!Array.isArray(ownedIds) || ownedIds.length === 0) {
+    return interaction.respond([]);
+  }
+
+  const owned = await getProductsByIds(ownedIds);
+
+  const filtered = owned
+    .filter((p) => p.name?.toLowerCase().includes(focused))
+    .slice(0, 25)
+    .map((p) => ({ name: p.name.slice(0, 100), value: p.id }));
+
+  return interaction.respond(filtered);
+}
+
 async function handleGet(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
