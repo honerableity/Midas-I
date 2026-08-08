@@ -50,6 +50,24 @@ client.once('clientReady', () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // Autocomplete requests are a separate interaction type from the actual
+  // slash command run -- routed to the same command file's autocomplete()
+  // export. No showModal/deferReply lifecycle here, just respond() with
+  // suggestions (Discord gives ~3s, same window as everything else).
+  if (interaction.isAutocomplete()) {
+    const command = client.commands.get(interaction.commandName);
+    if (!command?.autocomplete) return;
+
+    try {
+      await command.autocomplete(interaction);
+    } catch (err) {
+      console.error(`Error in /${interaction.commandName} autocomplete:`, err);
+      // Can't reply with an error message to autocomplete -- just let it
+      // time out with no suggestions rather than crashing.
+    }
+    return;
+  }
+
   if (interaction.isChatInputCommand()) {
     const command = client.commands.get(interaction.commandName);
     if (!command) return;
