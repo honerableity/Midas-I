@@ -12,8 +12,10 @@ const {
   MessageFlags,
   ChannelType,
 } = require('discord.js');
+const { v4: uuidv4 } = require('uuid');
 const { logCommandActivity } = require('../utils/logger.js');
-const { listProductTypes, listProductsByType, getProduct } = require('../utils/products.js');
+const { listProductTypes, listProductsByType, getProduct, giveProductToUser } = require('../utils/products.js');
+const { getVerifiedUser } = require('../utils/verification.js');
 const {
   setTestiChannel,
   getTestiChannel,
@@ -24,6 +26,10 @@ const {
   getTicket,
   closeTicket,
   markTicketDeleted,
+  claimOrderCreateLock,
+  releaseOrderCreateLock,
+  saveOrderSelection,
+  getOrderSelection,
 } = require('../utils/tickets.js');
 
 const MAX_SELECT_OPTIONS = 25;
@@ -34,8 +40,7 @@ const MAX_SELECT_OPTIONS = 25;
 const CID = {
   PANEL_CATEGORY_SELECT: 'ticket_panel_category',
   ORDER_PRODUCT_SELECT: 'ticket_order_products',
-  ORDER_QTY_BTN: 'ticket_order_qty', // ticket_order_qty_{inc|dec}_{productId}
-  ORDER_CREATE_BTN: 'ticket_order_create',
+  ORDER_CREATE_BTN: 'ticket_order_create', // ticket_order_create_{selectionToken}
   SERVICE_OPEN_MODAL_BTN: 'ticket_service_open_modal',
   SERVICE_MODAL: 'ticket_service_modal',
   CS_CREATE_BTN: 'ticket_cs_create',
@@ -138,8 +143,7 @@ module.exports = {
 
     if (id === CID.PANEL_CATEGORY_SELECT) return onPanelCategorySelect(interaction);
     if (id === CID.ORDER_PRODUCT_SELECT) return onOrderProductSelect(interaction);
-    if (id.startsWith(CID.ORDER_QTY_BTN)) return onOrderQtyButton(interaction);
-    if (id === CID.ORDER_CREATE_BTN) return onOrderCreateButton(interaction);
+    if (id.startsWith(`${CID.ORDER_CREATE_BTN}_`)) return onOrderCreateButton(interaction);
     if (id === CID.SERVICE_OPEN_MODAL_BTN) return onServiceOpenModalButton(interaction);
     if (id === CID.SERVICE_MODAL) return onServiceModalSubmit(interaction);
     if (id === CID.CS_CREATE_BTN) return onCsCreateButton(interaction);
@@ -422,15 +426,17 @@ async function createTicketChannel(interaction, category, label) {
 
 // Selecting the "Order" panel category -> show a product multi-select
 // grouped across all types (flattened, capped at 25 -- Discord's select
-// option limit). Per-product qty steppers come after selection, not before,
-// since Discord select menus can't carry per-option numeric input.
+// option limit). No quantity step: these are one-off developer products, so
+// picking a product in the multi-select is the whole cart -- straight to
+// "Create ticket" after selection.
 async function onPanelCategorySelect(interaction) {
   const category = interaction.values[0];
 
   if (category === 'order') {
     // Ack immediately -- Firestore reads below (listProductTypes /
-    // listProductsByType loop) can push past the 3s interaction window,
-    // same cold-start trap as modals. deferReply first, editReply after.
+    // listProductsByType loop, verified-user lookup) can push past the 3s
+    // interaction window, same cold-start trap as modals. deferReply first,
+    // editReply after.
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const types = await listProductTypes(interaction.guildId);
@@ -448,7 +454,17 @@ async function onPanelCategorySelect(interaction) {
       return interaction.editReply({ content: 'No products are available right now.' });
     }
 
-    const options = allProducts.slice(0, MAX_SELECT_OPTIONS).map((p) => ({
+    // Filter out products the user already owns -- they buy each product
+    // once (no quantity), so an owned product has nothing left to sell them.
+    const verifiedUser = await getVerifiedUser(interaction.user.id);
+    const owned = new Set(verifiedUser?.ownedProducts || []);
+    const purchasable = allProducts.filter((p) => !owned.has(p.id));
+
+    if (purchasable.length === 0) {
+      return interaction.editReply({ content: 'You already own every available product.' });
+    }
+
+    const options = purchasable.slice(0, MAX_SELECT_OPTIONS).map((p) => ({
       label: p.name.slice(0, 100),
       description: `${p.type} — ${p.price}`.slice(0, 100),
       value: p.id,
@@ -462,7 +478,7 @@ async function onPanelCategorySelect(interaction) {
       .addOptions(options);
 
     return interaction.editReply({
-      content: 'Pick the product(s) you want to buy:',
+      content: 'Pick the product(s) you want to buy (already-owned products are hidden):',
       components: [new ActionRowBuilder().addComponents(select)],
     });
   }
@@ -494,61 +510,6 @@ async function onPanelCategorySelect(interaction) {
   }
 }
 
-// Cart state is kept in the ephemeral message's embed/components themselves
-// (qty encoded in the button labels) rather than in memory/Firestore, so it
-// survives fine across multiple button clicks without needing a cache --
-// each click re-reads the current cart from the message it's attached to.
-function buildCartFromMessage(message, allProductsMap) {
-  // Cart rows are stored as one ActionRow per product: [qty label button
-  // (disabled, shows "Name x2"), "-" button, "+" button]. Parse back out.
-  const cart = [];
-  for (const row of message.components) {
-    const buttons = row.components;
-    const qtyBtn = buttons.find((b) => b.customId?.startsWith(`${CID.ORDER_QTY_BTN}_label_`));
-    if (!qtyBtn) continue;
-    const productId = qtyBtn.customId.replace(`${CID.ORDER_QTY_BTN}_label_`, '');
-    const match = qtyBtn.label.match(/x(\d+)$/);
-    const qty = match ? parseInt(match[1], 10) : 1;
-    cart.push({ productId, qty });
-  }
-  return cart;
-}
-
-function buildCartComponents(cart, productsMap) {
-  const rows = cart.map((item) => {
-    const product = productsMap.get(item.productId);
-    const name = product ? product.name : 'Unknown product';
-    return new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`${CID.ORDER_QTY_BTN}_dec_${item.productId}`)
-        .setLabel('-')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`${CID.ORDER_QTY_BTN}_label_${item.productId}`)
-        .setLabel(`${name} x${item.qty}`.slice(0, 80))
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId(`${CID.ORDER_QTY_BTN}_inc_${item.productId}`)
-        .setLabel('+')
-        .setStyle(ButtonStyle.Secondary),
-    );
-  });
-
-  // Discord caps 5 action rows per message; qty rows use up to 4, leaving
-  // the last row for the Create ticket button.
-  const cartRows = rows.slice(0, 4);
-
-  const createRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(CID.ORDER_CREATE_BTN)
-      .setLabel('Create ticket')
-      .setStyle(ButtonStyle.Success)
-  );
-
-  return [...cartRows, createRow];
-}
-
 async function loadProductsMap(productIds) {
   const map = new Map();
   for (const id of productIds) {
@@ -558,8 +519,10 @@ async function loadProductsMap(productIds) {
   return map;
 }
 
-// Initial product multi-select submit -> build the qty-stepper cart, all
-// items starting at qty 1.
+// Product multi-select submit -> straight to a confirm screen (no qty step,
+// see module header). Selected product ids are round-tripped via the
+// Create-ticket button's customId itself rather than re-derived from the
+// message, since there's no per-item state left to encode after dropping qty.
 async function onOrderProductSelect(interaction) {
   // deferUpdate acks the select-menu click immediately -- loadProductsMap
   // below is a Firestore loop and can push past the 3s window otherwise.
@@ -567,76 +530,82 @@ async function onOrderProductSelect(interaction) {
 
   const productIds = interaction.values;
   const productsMap = await loadProductsMap(productIds);
+  const validIds = productIds.filter((id) => productsMap.has(id));
 
-  const cart = productIds.filter((id) => productsMap.has(id)).map((id) => ({ productId: id, qty: 1 }));
-
-  if (cart.length === 0) {
+  if (validIds.length === 0) {
     return interaction.editReply({ content: 'Selected product(s) no longer exist. Try again.', components: [] });
   }
 
-  const components = buildCartComponents(cart, productsMap);
+  const summaryLines = validIds.map((id) => {
+    const p = productsMap.get(id);
+    return `**${p.name}** — ${p.price}`;
+  });
+
+  const total = validIds.reduce((sum, id) => sum + parsePrice(productsMap.get(id).price), 0);
+
+  const token = uuidv4();
+  await saveOrderSelection(token, interaction.user.id, validIds);
+
+  const createBtn = new ButtonBuilder()
+    .setCustomId(`${CID.ORDER_CREATE_BTN}_${token}`)
+    .setLabel('Create ticket')
+    .setStyle(ButtonStyle.Success);
 
   return interaction.editReply({
-    content: 'Adjust quantity with +/- then click **Create ticket**:',
-    components,
+    content: `${summaryLines.join('\n')}\n\n**Total: ${formatIDR(total)}**`,
+    components: [new ActionRowBuilder().addComponents(createBtn)],
   });
 }
 
-// +/- buttons on the cart. Re-derives cart state from the message's current
-// buttons (see buildCartFromMessage) so no external state store is needed.
-async function onOrderQtyButton(interaction) {
-  const id = interaction.customId;
-  const isInc = id.startsWith(`${CID.ORDER_QTY_BTN}_inc_`);
-  const isDec = id.startsWith(`${CID.ORDER_QTY_BTN}_dec_`);
-  if (!isInc && !isDec) return;
-
-  // Ack first -- same cold-start Firestore trap as onOrderProductSelect.
-  await interaction.deferUpdate();
-
-  const productId = id.replace(`${CID.ORDER_QTY_BTN}_${isInc ? 'inc' : 'dec'}_`, '');
-
-  const cart = buildCartFromMessage(interaction.message);
-  const item = cart.find((c) => c.productId === productId);
-  if (!item) return;
-
-  if (isInc) item.qty = Math.min(item.qty + 1, 99);
-  if (isDec) item.qty = Math.max(item.qty - 1, 1);
-
-  const productsMap = await loadProductsMap(cart.map((c) => c.productId));
-  const components = buildCartComponents(cart, productsMap);
-
-  return interaction.editReply({ components });
-}
-
-// "Create ticket" on the order cart -> creates the channel, sums total,
-// writes the ticket doc, posts a summary embed inside the new channel.
+// "Create ticket" on the order confirm screen -> creates the channel, sums
+// total, writes the ticket doc, posts a summary embed inside the new
+// channel.
+//
+// Double-click failsafe: Discord can occasionally dispatch the same button
+// press as two separate interactions (client retry / fast double-tap
+// landing before the button visually disables). deferUpdate() on both
+// wouldn't stop the second one from still running channel-creation code
+// after it. Instead we take a short-lived per-user lock in Firestore
+// (claimOrderCreateLock) -- the first call to win the transaction proceeds
+// normally; a second concurrent call sees the lock held, still has to
+// create *a* channel (interaction already committed to it by the time we'd
+// know), but immediately deletes that duplicate and tells the user to use
+// the first ticket instead.
 async function onOrderCreateButton(interaction) {
   await interaction.deferUpdate();
 
-  const cart = buildCartFromMessage(interaction.message);
-  if (cart.length === 0) {
-    return interaction.editReply({ content: 'Cart is empty.', components: [] });
+  const token = interaction.customId.replace(`${CID.ORDER_CREATE_BTN}_`, '');
+  const selection = await getOrderSelection(token);
+
+  if (!selection || selection.userId !== interaction.user.id) {
+    return interaction.editReply({ content: 'This selection has expired. Please start over from the ticket panel.', components: [] });
   }
 
-  const productsMap = await loadProductsMap(cart.map((c) => c.productId));
+  const productIds = selection.productIds;
 
-  const lineItems = cart
-    .filter((c) => productsMap.has(c.productId))
-    .map((c) => {
-      const p = productsMap.get(c.productId);
-      const unitPrice = parsePrice(p.price);
-      return {
-        productId: c.productId,
-        name: p.name,
-        price: p.price,
-        qty: c.qty,
-        lineTotal: unitPrice * c.qty,
-      };
+  const gotLock = await claimOrderCreateLock(interaction.user.id);
+
+  const productsMap = await loadProductsMap(productIds);
+  const lineItems = productIds
+    .filter((id) => productsMap.has(id))
+    .map((id) => {
+      const p = productsMap.get(id);
+      return { productId: id, name: p.name, price: p.price, lineTotal: parsePrice(p.price) };
     });
 
   const total = lineItems.reduce((sum, li) => sum + li.lineTotal, 0);
 
   const channel = await createTicketChannel(interaction, 'order', 'Order');
+
+  if (!gotLock) {
+    // Lost the race -- this is the duplicate from a double-click. Clean up
+    // the channel we just had to create and point the user at the real one.
+    await channel.delete('Duplicate ticket from double-click').catch(() => {});
+    return interaction.editReply({
+      content: 'Looks like that got clicked twice -- your ticket was already created, check your channel list.',
+      components: [],
+    });
+  }
 
   await createTicket({
     guildId: interaction.guildId,
@@ -647,7 +616,9 @@ async function onOrderCreateButton(interaction) {
     total,
   });
 
-  const summaryLines = lineItems.map((li) => `**${li.name}** x${li.qty} — ${formatIDR(li.price ? parsePrice(li.price) : 0) || li.price} each = ${formatIDR(li.lineTotal)}`);
+  await releaseOrderCreateLock(interaction.user.id);
+
+  const summaryLines = lineItems.map((li) => `**${li.name}** — ${formatIDR(li.lineTotal)}`);
 
   const embed = new EmbedBuilder()
     .setTitle('New Order Ticket')
@@ -802,7 +773,7 @@ async function handleDone(interaction) {
   }
 
   const productList = Array.isArray(ticket.products) && ticket.products.length > 0
-    ? ticket.products.map((p) => `${p.name} x${p.qty}`).join(', ')
+    ? ticket.products.map((p) => p.name).join(', ')
     : (ticket.category === 'service' ? 'Service' : 'Customer Service');
 
   const totalPrice = ticket.total ? formatIDR(ticket.total) : 'N/A';
@@ -816,6 +787,34 @@ async function handleDone(interaction) {
 
   await testiChannel.send({ embeds: [testiEmbed] });
 
+  // Order tickets: /ticket done is the normal purchase-completion path --
+  // grant ownership of each product and DM the file link, same delivery
+  // pattern /product get already uses. Admins can still grant manually via
+  // /product give; this just makes /ticket done do it automatically so the
+  // admin doesn't have to do both steps per sale.
+  const deliveryFailures = [];
+  if (Array.isArray(ticket.products) && ticket.products.length > 0) {
+    const creator = await interaction.client.users.fetch(ticket.creatorId).catch(() => null);
+
+    for (const item of ticket.products) {
+      await giveProductToUser(item.productId, ticket.creatorId).catch((err) => {
+        console.error(`Failed to grant product ${item.productId} to ${ticket.creatorId}:`, err);
+        deliveryFailures.push(item.name);
+      });
+
+      const product = await getProduct(item.productId).catch(() => null);
+      if (!creator || !product?.fileLink) continue;
+
+      try {
+        await creator.send(`Here's your file for **${product.name}**: ${product.fileLink}`);
+      } catch {
+        // DMs closed/blocked -- ownership is still granted, just flag it so
+        // the admin knows to deliver the link another way.
+        deliveryFailures.push(`${item.name} (DM failed)`);
+      }
+    }
+  }
+
   await closeTicket(channelId, { ticketNumber });
 
   await logCommandActivity(interaction, {
@@ -824,5 +823,9 @@ async function handleDone(interaction) {
     fields: { discordUser: interaction.user, ticketChannel: `<#${channelId}>`, total: totalPrice },
   });
 
-  return modalSubmit.editReply({ content: 'Ticket marked done, testimonial posted.' });
+  const deliveryNote = deliveryFailures.length > 0
+    ? `\nCouldn't fully deliver: ${deliveryFailures.join(', ')}. Check manually.`
+    : '';
+
+  return modalSubmit.editReply({ content: `Ticket marked done, testimonial posted.${deliveryNote}` });
 }

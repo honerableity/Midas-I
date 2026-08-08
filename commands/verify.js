@@ -25,6 +25,7 @@ const {
   EXPIRY_MS,
 } = require('../utils/verification.js');
 const { logCommandActivity } = require('../utils/logger.js');
+const { getProductsByIds } = require('../utils/products.js');
 
 // Builds one page of the Groups list onto the given embed. items is a flat
 // array of pre-formatted "Name — Role" strings. page is 0-indexed.
@@ -211,6 +212,11 @@ module.exports = {
         fields: { discordUser: interaction.user, targetUser: target },
       });
 
+      // Fetched once up front alongside details -- cheap (single batched
+      // getAll), avoids re-fetching every time the user flips to the
+      // Products tab in the collector below.
+      const ownedProducts = await getProductsByIds(record.ownedProducts || []);
+
       // Pagination state lives in this closure per response — one profile card,
       // one collector, reset whenever the tab changes (page always starts at 0
       // on a fresh tab so switching Groups -> Account doesn't carry over an
@@ -250,6 +256,10 @@ module.exports = {
           return paginateListField(embed, 'Groups', details.groups.map(g => `${g.name} — ${g.role}`), state.page, PAGE_SIZE);
         }
 
+        if (state.tab === 'products') {
+          return paginateListField(embed, 'Owned Products', ownedProducts.map(p => `${p.name} — ${p.price}`), state.page, PAGE_SIZE);
+        }
+
         // account tab
         embed.addFields(
           { name: 'Roblox ID', value: `${record.robloxId}`, inline: true },
@@ -263,15 +273,17 @@ module.exports = {
         const tabRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('profile_tab_overview').setLabel('Overview').setStyle(state.tab === 'overview' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
           new ButtonBuilder().setCustomId('profile_tab_groups').setLabel('Groups').setStyle(state.tab === 'groups' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
+          new ButtonBuilder().setCustomId('profile_tab_products').setLabel('Products').setStyle(state.tab === 'products' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled),
           new ButtonBuilder().setCustomId('profile_tab_account').setLabel('Account').setStyle(state.tab === 'account' ? ButtonStyle.Primary : ButtonStyle.Secondary).setDisabled(disabled)
         );
 
         const rows = [tabRow];
 
-        // Prev/Next only make sense on the Groups tab, and only get added
+        // Prev/Next only make sense on paginated tabs, and only get added
         // when there's more than one page to move between.
-        if (state.tab === 'groups') {
-          const totalPages = Math.max(1, Math.ceil(details.groups.length / PAGE_SIZE));
+        if (state.tab === 'groups' || state.tab === 'products') {
+          const items = state.tab === 'groups' ? details.groups : ownedProducts;
+          const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
           if (totalPages > 1) {
             rows.push(new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId('profile_page_prev').setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(disabled || state.page === 0),
