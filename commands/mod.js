@@ -124,6 +124,12 @@ module.exports = {
 
     .addSubcommand((sub) =>
       sub
+        .setName('membercount')
+        .setDescription('Show the server member count')
+    )
+
+    .addSubcommand((sub) =>
+      sub
         .setName('honeypot')
         .setDescription('Set a channel that instant-bans anyone who types in it')
         .addChannelOption((opt) =>
@@ -146,6 +152,7 @@ module.exports = {
       unvcmute: { label: 'Mod — VC Unmute', fields: ['discordUser', 'reason'] },
       warn: { label: 'Mod — Warn', fields: ['discordUser', 'reason', 'warnCount'] },
       setwarn: { label: 'Mod — Set Warn Rule', fields: ['warnCount', 'action', 'duration', 'role'] },
+      membercount: { label: 'Mod — Member Count', fields: ['memberCount'] },
       honeypot: { label: 'Mod — Honeypot Set', fields: ['channel'] },
       honeypotTrigger: { label: 'Mod — Honeypot Triggered', fields: ['discordUser', 'channel'] },
     },
@@ -187,6 +194,8 @@ module.exports = {
           return await handleWarn(interaction);
         case 'setwarn':
           return await handleSetWarn(interaction);
+        case 'membercount':
+          return await handleMemberCount(interaction);
         case 'honeypot':
           return await handleHoneypot(interaction);
         default:
@@ -593,6 +602,23 @@ async function handleSetWarn(interaction) {
     subcommand: 'setwarn',
     success: true,
     fields: { warnCount: warncount, action, duration: durationInput, role: role?.name },
+  });
+}
+
+async function handleMemberCount(interaction) {
+  const guild = interaction.guild;
+  // memberCount is cached on the guild object and updates on join/leave events
+  // -- no fetch needed, no Firestore call.
+  const total = guild.memberCount;
+  const humans = guild.members.cache.filter((m) => !m.user.bot).size;
+  const bots = guild.members.cache.filter((m) => m.user.bot).size;
+
+  await interaction.editReply({ content: `**${guild.name}** has **${total}** members (${humans} humans, ${bots} bots).` });
+
+  await logCommandActivity(interaction, {
+    subcommand: 'membercount',
+    success: true,
+    fields: { memberCount: total },
   });
 }
 
