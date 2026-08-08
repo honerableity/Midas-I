@@ -9,7 +9,12 @@ if (!process.env.DISCORD_TOKEN) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 client.commands = new Collection();
@@ -47,6 +52,24 @@ deployCommands();
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Reverses temp-bans and temp-vcmutes past their expiry. Runs once
+  // immediately (catches anything missed while offline) then every 60s.
+  const { startExpiryScanner } = require('./utils/moderation.js');
+  startExpiryScanner(client);
+});
+
+// Honeypot channel watch -- separate from the command/component router below
+// since this fires on every message, not on interactions.
+client.on('messageCreate', async (message) => {
+  const modCommand = client.commands.get('mod');
+  if (!modCommand?.handleHoneypotMessage) return;
+
+  try {
+    await modCommand.handleHoneypotMessage(message);
+  } catch (err) {
+    console.error('[mod] honeypot handler failed:', err);
+  }
 });
 
 client.on('interactionCreate', async (interaction) => {
