@@ -1,5 +1,6 @@
 const { db } = require('./firebase.js');
 const { FieldValue } = require('firebase-admin/firestore');
+const { PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 
 // ---------- duration parsing ----------
 // Accepts "10m", "2h", "3d", "1w", or "permanent"/"none"/empty -> null (permanent).
@@ -32,6 +33,36 @@ function formatDuration(ms) {
   if (days < 7) return `${days}d`;
   const weeks = Math.round(days / 7);
   return `${weeks}w`;
+}
+
+// ---------- protected target guard ----------
+// Blocks mod actions against: server owner, any bot account, anyone with
+// Manage Server permission. `member` is a fetched GuildMember (null if the
+// target isn't in the guild -- e.g. unban-by-id). `user` is the base User,
+// used as fallback for the bot check when member is null.
+function isProtectedTarget(guild, member, user) {
+  const targetUser = member?.user || user;
+  if (targetUser?.id === guild.ownerId) return { blocked: true, reason: 'server owner' };
+  if (targetUser?.bot) return { blocked: true, reason: 'bot account' };
+  if (member?.permissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return { blocked: true, reason: 'has Manage Server permission' };
+  }
+  return { blocked: false };
+}
+
+// ---------- mod action DM ----------
+// Best-effort DM to the target. Never throws -- caller does not need to catch.
+// No moderator name/tag is included by design (privacy).
+async function sendModDM(user, { guildName, action, reason, duration, reversal = false }) {
+  const embed = new EmbedBuilder()
+    .setTitle(reversal ? `Action reversed: ${action}` : `Moderation action: ${action}`)
+    .setColor(reversal ? 0x57f287 : 0xed4245)
+    .addFields({ name: 'Server', value: guildName });
+
+  if (reason) embed.addFields({ name: 'Reason', value: reason });
+  if (duration !== undefined) embed.addFields({ name: 'Duration', value: duration });
+
+  await user.send({ embeds: [embed] }).catch(() => {});
 }
 
 // ---------- guild mod config (setwarn thresholds) ----------
@@ -183,6 +214,8 @@ function startExpiryScanner(client, intervalMs = 60 * 1000) {
 module.exports = {
   parseDuration,
   formatDuration,
+  isProtectedTarget,
+  sendModDM,
   getWarnThresholds,
   addWarnThreshold,
   addWarn,
