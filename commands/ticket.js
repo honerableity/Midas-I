@@ -24,10 +24,11 @@ const {
   nextTicketNumber,
   createTicket,
   getTicket,
+  findOpenTicket,
   closeTicket,
   markTicketDeleted,
-  claimOrderCreateLock,
-  releaseOrderCreateLock,
+  claimTicketCreateLock,
+  releaseTicketCreateLock,
   saveOrderSelection,
   getOrderSelection,
 } = require('../utils/tickets.js');
@@ -433,11 +434,16 @@ async function onPanelCategorySelect(interaction) {
   const category = interaction.values[0];
 
   if (category === 'order') {
-    // Ack immediately -- Firestore reads below (listProductTypes /
-    // listProductsByType loop, verified-user lookup) can push past the 3s
-    // interaction window, same cold-start trap as modals. deferReply first,
-    // editReply after.
+    // Ack immediately -- Firestore reads below (findOpenTicket,
+    // listProductTypes / listProductsByType loop, verified-user lookup) can
+    // push past the 3s interaction window, same cold-start trap as modals.
+    // deferReply first, editReply after.
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'order');
+    if (existing) {
+      return interaction.editReply({ content: `You already have an open order ticket: <#${existing.channelId}>` });
+    }
 
     const types = await listProductTypes(interaction.guildId);
     if (types.length === 0) {
@@ -484,28 +490,42 @@ async function onPanelCategorySelect(interaction) {
   }
 
   if (category === 'service') {
+    // deferReply first -- findOpenTicket below is a Firestore read, same
+    // cold-start ack-window risk as the order branch.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'service');
+    if (existing) {
+      return interaction.editReply({ content: `You already have an open service ticket: <#${existing.channelId}>` });
+    }
+
     const btn = new ButtonBuilder()
       .setCustomId(CID.SERVICE_OPEN_MODAL_BTN)
       .setLabel('Fill service request')
       .setStyle(ButtonStyle.Primary);
 
-    return interaction.reply({
+    return interaction.editReply({
       content: 'Click below to describe the service you need:',
       components: [new ActionRowBuilder().addComponents(btn)],
-      flags: MessageFlags.Ephemeral,
     });
   }
 
   if (category === 'customerservice') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'customerservice');
+    if (existing) {
+      return interaction.editReply({ content: `You already have an open customer service ticket: <#${existing.channelId}>` });
+    }
+
     const btn = new ButtonBuilder()
       .setCustomId(CID.CS_CREATE_BTN)
       .setLabel('Create ticket')
       .setStyle(ButtonStyle.Primary);
 
-    return interaction.reply({
+    return interaction.editReply({
       content: 'Click below to open a customer service ticket:',
       components: [new ActionRowBuilder().addComponents(btn)],
-      flags: MessageFlags.Ephemeral,
     });
   }
 }
@@ -565,12 +585,12 @@ async function onOrderProductSelect(interaction) {
 // press as two separate interactions (client retry / fast double-tap
 // landing before the button visually disables). deferUpdate() on both
 // wouldn't stop the second one from still running channel-creation code
-// after it. Instead we take a short-lived per-user lock in Firestore
-// (claimOrderCreateLock) -- the first call to win the transaction proceeds
-// normally; a second concurrent call sees the lock held, still has to
-// create *a* channel (interaction already committed to it by the time we'd
-// know), but immediately deletes that duplicate and tells the user to use
-// the first ticket instead.
+// after it. Instead we take a short-lived per-user-per-category lock in
+// Firestore (claimTicketCreateLock) -- the first call to win the
+// transaction proceeds normally; a second concurrent call sees the lock
+// held, still has to create *a* channel (interaction already committed to
+// it by the time we'd know), but immediately deletes that duplicate and
+// tells the user to use the first ticket instead.
 async function onOrderCreateButton(interaction) {
   await interaction.deferUpdate();
 
@@ -583,7 +603,20 @@ async function onOrderCreateButton(interaction) {
 
   const productIds = selection.productIds;
 
-  const gotLock = await claimOrderCreateLock(interaction.user.id);
+  const gotLock = await claimTicketCreateLock(interaction.user.id, 'order');
+
+  // Re-check for an existing open order ticket even though the category-
+  // select screen already checked this -- the user could have opened two
+  // order flows before either finished, or double-clicked Create fast
+  // enough that both requests pass the earlier check. This is the last
+  // gate before a channel actually gets made.
+  if (gotLock) {
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'order');
+    if (existing) {
+      await releaseTicketCreateLock(interaction.user.id, 'order');
+      return interaction.editReply({ content: `You already have an open order ticket: <#${existing.channelId}>`, components: [] });
+    }
+  }
 
   const productsMap = await loadProductsMap(productIds);
   const lineItems = productIds
@@ -616,7 +649,7 @@ async function onOrderCreateButton(interaction) {
     total,
   });
 
-  await releaseOrderCreateLock(interaction.user.id);
+  await releaseTicketCreateLock(interaction.user.id, 'order');
 
   const summaryLines = lineItems.map((li) => `**${li.name}** — ${formatIDR(li.lineTotal)}`);
 
@@ -665,9 +698,25 @@ async function onServiceOpenModalButton(interaction) {
 async function onServiceModalSubmit(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+  const gotLock = await claimTicketCreateLock(interaction.user.id, 'service');
+
+  if (gotLock) {
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'service');
+    if (existing) {
+      await releaseTicketCreateLock(interaction.user.id, 'service');
+      return interaction.editReply({ content: `You already have an open service ticket: <#${existing.channelId}>` });
+    }
+  }
+
   const answer = interaction.fields.getTextInputValue('service_answer').trim();
 
   const channel = await createTicketChannel(interaction, 'service', 'Service');
+
+  if (!gotLock) {
+    // Lost the double-click race -- clean up the duplicate channel.
+    await channel.delete('Duplicate ticket from double-click').catch(() => {});
+    return interaction.editReply({ content: 'Looks like that got submitted twice -- your ticket was already created, check your channel list.' });
+  }
 
   await createTicket({
     guildId: interaction.guildId,
@@ -676,6 +725,8 @@ async function onServiceModalSubmit(interaction) {
     creatorId: interaction.user.id,
     serviceAnswer: answer,
   });
+
+  await releaseTicketCreateLock(interaction.user.id, 'service');
 
   const embed = new EmbedBuilder()
     .setTitle('New Service Ticket')
@@ -695,7 +746,25 @@ async function onServiceModalSubmit(interaction) {
 async function onCsCreateButton(interaction) {
   await interaction.deferUpdate();
 
+  const gotLock = await claimTicketCreateLock(interaction.user.id, 'customerservice');
+
+  if (gotLock) {
+    const existing = await findOpenTicket(interaction.guildId, interaction.user.id, 'customerservice');
+    if (existing) {
+      await releaseTicketCreateLock(interaction.user.id, 'customerservice');
+      return interaction.editReply({ content: `You already have an open customer service ticket: <#${existing.channelId}>`, components: [] });
+    }
+  }
+
   const channel = await createTicketChannel(interaction, 'customerservice', 'Customer Service');
+
+  if (!gotLock) {
+    await channel.delete('Duplicate ticket from double-click').catch(() => {});
+    return interaction.editReply({
+      content: 'Looks like that got clicked twice -- your ticket was already created, check your channel list.',
+      components: [],
+    });
+  }
 
   await createTicket({
     guildId: interaction.guildId,
@@ -703,6 +772,8 @@ async function onCsCreateButton(interaction) {
     category: 'customerservice',
     creatorId: interaction.user.id,
   });
+
+  await releaseTicketCreateLock(interaction.user.id, 'customerservice');
 
   await channel.send({
     content: `${interaction.user} Please wait for an admin to answer your ticket.`,
