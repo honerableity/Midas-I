@@ -107,7 +107,7 @@ module.exports = {
         .setName('close')
         .setDescription('Close and delete a ticket, DM the creator')
         .addChannelOption(opt =>
-          opt.setName('channel').setDescription('Ticket channel to close').setRequired(true).addChannelTypes(ChannelType.GuildText)
+          opt.setName('channel').setDescription('Ticket channel to close (default: current channel)').setRequired(false).addChannelTypes(ChannelType.GuildText)
         )
     ),
 
@@ -331,7 +331,9 @@ async function handleClose(interaction) {
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const targetChannel = interaction.options.getChannel('channel', true);
+  // channel now optional -- falls back to the channel the command was run
+  // in, so admins can just run /ticket close inside the ticket itself.
+  const targetChannel = interaction.options.getChannel('channel') ?? interaction.channel;
 
   const ticket = await getTicket(targetChannel.id);
   if (!ticket) {
